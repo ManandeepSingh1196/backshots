@@ -227,7 +227,7 @@ def validate_funding(df: pl.DataFrame, dataset: str) -> ValidationReport:
     gaps: list[Gap] = []
     if ordered:
         d = _diffs(df).filter(pl.col("d_us") > limit_us)
-        gaps = [Gap(a, b, round(d_us / interval_us) - 1) for a, b, d_us in d.iter_rows()]
+        gaps = [Gap(a, b, max(1, round(d_us / interval_us) - 1)) for a, b, d_us in d.iter_rows()]
     flags = _flags(df, pl.col("rate").abs() > _EXTREME_RATE, "extreme_rate")
     return ValidationReport(
         dataset, df.height, first_ts, last_ts, tuple(errors), tuple(gaps), _sorted_flags(flags)
