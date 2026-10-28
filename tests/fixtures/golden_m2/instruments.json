@@ -1,0 +1,36 @@
+{
+  "fetched_at": "2024-02-01T00:00:00+00:00",
+  "instruments": [
+    {
+      "base": "AAA",
+      "kind": "spot",
+      "maint_margin_rate": 0.0,
+      "maker_fee": 0.001,
+      "max_leverage": 1.0,
+      "min_notional": 5.0,
+      "min_qty": 0.001,
+      "price_tick": 0.01,
+      "qty_step": 0.001,
+      "quote": "USDT",
+      "symbol": "AAAUSDT",
+      "taker_fee": 0.001,
+      "venue_symbol": "AAAUSDT"
+    },
+    {
+      "base": "BBB",
+      "kind": "spot",
+      "maint_margin_rate": 0.0,
+      "maker_fee": 0.001,
+      "max_leverage": 1.0,
+      "min_notional": 5.0,
+      "min_qty": 0.1,
+      "price_tick": 0.01,
+      "qty_step": 0.1,
+      "quote": "USDT",
+      "symbol": "BBBUSDT",
+      "taker_fee": 0.001,
+      "venue_symbol": "BBBUSDT"
+    }
+  ],
+  "version": 1
+}
