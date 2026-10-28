@@ -14,9 +14,10 @@ from bt.data.catalog import Catalog
 from bt.data.fetch_binance import (
     ArchiveFile,
     daily_kline_archive_files,
+    funding_archive_files,
     kline_archive_files,
 )
-from bt.data.ingest import IngestResult, ingest_klines
+from bt.data.ingest import IngestResult, ingest_funding, ingest_klines
 from bt.data.validate import Gap
 from tests.support.binance_archive import (
     ArchiveServer,
@@ -24,7 +25,7 @@ from tests.support.binance_archive import (
     build_checksum,
     build_csv_zip,
 )
-from tests.support.fake_exchange import FakeExchange, epoch_ms, kline_row
+from tests.support.fake_exchange import FakeExchange, epoch_ms, funding_row, kline_row
 
 DAY = timedelta(days=1)
 NOW = datetime(2024, 3, 10, 1, 0, tzinfo=UTC)
@@ -288,3 +289,114 @@ def test_no_data_at_all_is_empty_and_not_stored(catalog: Catalog) -> None:
 def test_naive_now_raises(catalog: Catalog) -> None:
     with pytest.raises(TimezoneError):
         run(catalog, {}, FakeExchange(), now=datetime(2024, 3, 10, 1, 0))  # noqa: DTZ001
+
+
+# --------------------------------------------------------------------------- funding
+
+FUNDING_TAG = "ccxt:binance:fundingRate"
+H8 = timedelta(hours=8)
+
+
+def events(first: datetime, last: datetime) -> list[datetime]:
+    out: list[datetime] = []
+    t = first
+    while t <= last:
+        out.append(t)
+        t += H8
+    return out
+
+
+def funding_csv(ts: Iterable[datetime]) -> bytes:
+    lines = ["calc_time,funding_interval_hours,last_funding_rate"]
+    lines += [f"{epoch_ms(t)},8,0.00010000" for t in ts]
+    return ("\n".join(lines) + "\n").encode()
+
+
+def funding_exchange(ts: Iterable[datetime]) -> FakeExchange:
+    fake = FakeExchange()
+    fake.set_funding("BTCUSDT", [funding_row(epoch_ms(t), "0.0002", "42000.5") for t in ts])
+    return fake
+
+
+def funding_responses(today: date, feb: bool = True) -> dict[str, Response]:
+    files = {f.period: f for f in funding_archive_files("BTCUSDT", date(2024, 1, 1), today, today)}
+    responses: dict[str, Response] = {}
+    jan = events(datetime(2024, 1, 1, tzinfo=UTC), datetime(2024, 1, 31, 16, tzinfo=UTC))
+    publish(responses, files["2024-01"], funding_csv(jan))
+    if feb:
+        feb_ev = events(datetime(2024, 2, 1, tzinfo=UTC), datetime(2024, 2, 29, 16, tzinfo=UTC))
+        publish(responses, files["2024-02"], funding_csv(feb_ev))
+    return responses
+
+
+def run_funding(
+    catalog: Catalog,
+    responses: dict[str, Response],
+    fake: FakeExchange,
+    now: datetime = NOW,
+    end: date | None = None,
+) -> tuple[IngestResult, ArchiveServer]:
+    server = ArchiveServer(responses)
+    with server.client() as client:
+        result = ingest_funding(catalog, client, fake, "BTCUSDT", date(2024, 1, 1), end, now)
+    return result, server
+
+
+def test_funding_archive_plus_ccxt_tail(catalog: Catalog) -> None:
+    tail = events(datetime(2024, 3, 1, tzinfo=UTC), datetime(2024, 3, 10, 8, tzinfo=UTC))
+    assert len(tail) == 29  # 28 up to 03-10T00:00 plus 03-10T08:00 (after now)
+    result, _ = run_funding(catalog, funding_responses(NOW.date()), funding_exchange(tail))
+    entry = result.entry
+    assert entry is not None
+    assert result.dataset == "perp/funding/BTCUSDT"
+    assert entry.rows == 93 + 87 + 28 == 208
+    assert entry.last_ts == datetime(2024, 3, 10, tzinfo=UTC)
+    assert entry.sources[-1] == FUNDING_TAG
+    assert len(entry.checksums) == 2
+    assert result.missing_archives == ()
+    df = catalog.read_funding("BTCUSDT")
+    assert df.filter(pl.col("ts") < at(date(2024, 3, 1)))["mark_price"].null_count() == 180
+    assert df.filter(pl.col("ts") >= at(date(2024, 3, 1)))["mark_price"].null_count() == 0
+
+
+def test_funding_monthly_lag_404_is_filled_by_ccxt(catalog: Catalog) -> None:
+    now = datetime(2024, 3, 2, 1, 0, tzinfo=UTC)
+    responses = funding_responses(now.date(), feb=False)
+    tail = events(datetime(2024, 2, 1, tzinfo=UTC), datetime(2024, 3, 2, 0, tzinfo=UTC))
+    result, _ = run_funding(catalog, responses, funding_exchange(tail), now=now)
+    assert result.entry is not None
+    assert result.missing_archives == ()
+    assert result.report.gaps == ()
+    assert result.entry.rows == 93 + 87 + 3 + 1  # Feb, 03-01 x3, 03-02T00:00
+    assert len(result.entry.checksums) == 1
+
+
+def test_funding_monthly_404_not_lag_is_missing(catalog: Catalog) -> None:
+    responses = funding_responses(NOW.date(), feb=False)
+    files = {
+        f.period: f
+        for f in funding_archive_files("BTCUSDT", date(2024, 1, 1), NOW.date(), NOW.date())
+    }
+    tail = events(datetime(2024, 3, 1, tzinfo=UTC), datetime(2024, 3, 10, tzinfo=UTC))
+    result, _ = run_funding(catalog, responses, funding_exchange(tail))
+    assert result.entry is not None
+    assert result.missing_archives == (files["2024-02"].url,)
+    assert len(result.report.gaps) == 1
+
+
+def test_funding_end_excludes_tail_events_after_end(catalog: Catalog) -> None:
+    fake = funding_exchange(
+        events(datetime(2024, 3, 1, tzinfo=UTC), datetime(2024, 3, 9, tzinfo=UTC))
+    )
+    result, _ = run_funding(catalog, funding_responses(NOW.date()), fake, end=date(2024, 2, 29))
+    assert result.entry is not None
+    assert result.entry.rows == 180
+    assert result.entry.last_ts == datetime(2024, 2, 29, 16, tzinfo=UTC)
+    assert FUNDING_TAG not in result.entry.sources
+    # the tail is bounded at end + 1 day, so the 03-01 events are never even requested
+    assert len(fake.calls_to("fapiPublicGetFundingRate")) == 1
+
+
+def test_funding_naive_now_raises(catalog: Catalog) -> None:
+    with pytest.raises(TimezoneError):
+        run_funding(catalog, {}, FakeExchange(), now=datetime(2024, 3, 10, 1, 0))  # noqa: DTZ001

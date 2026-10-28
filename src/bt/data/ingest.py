@@ -23,16 +23,20 @@ from bt.data.fetch_binance import (
     ArchiveFile,
     daily_kline_archive_files,
     download_archive,
+    funding_archive_files,
     kline_archive_files,
+    parse_funding_csv,
     parse_klines_csv,
 )
-from bt.data.fetch_ccxt import CcxtExchange, fetch_recent_klines
+from bt.data.fetch_ccxt import CcxtExchange, fetch_recent_funding, fetch_recent_klines
 from bt.data.validate import (
+    FUNDING_SCHEMA,
     KLINE_SCHEMA,
     TIMEFRAME_DELTA,
     Market,
     Timeframe,
     ValidationReport,
+    validate_funding,
     validate_klines,
 )
 
@@ -50,6 +54,8 @@ DEFAULT_START: Final[date] = date(2019, 1, 1)
 PUBLICATION_LAG_DAYS: Final[int] = 2
 
 _KLINES_TAG: Final = "ccxt:binance:klines"
+_FUNDING_TAG: Final = "ccxt:binance:fundingRate"
+_MS: Final = timedelta(milliseconds=1)
 _DAY: Final = timedelta(days=1)
 
 
@@ -198,4 +204,50 @@ def ingest_klines(
         report,
         archives.missing,
         lambda: catalog.write_klines(market, timeframe, symbol, df, sources, checksums, now),
+    )
+
+
+def ingest_funding(
+    catalog: Catalog,
+    client: httpx.Client,
+    exchange: CcxtExchange,
+    symbol: str,
+    start: date,
+    end: date | None,
+    now: datetime,
+) -> IngestResult:
+    """Rebuild one funding dataset from monthly archives plus a ccxt tail; store it if valid."""
+    now = ensure_utc(now, "now")
+    today = now.date()
+    end_d = today if end is None else end
+    dataset = f"perp/funding/{symbol}"
+
+    files = funding_archive_files(symbol, start, end_d, today)
+    archives = _collect(client, catalog.cache_dir(), files, today, None)
+    frames = [parse_funding_csv(a.csv) for a in archives.used]
+
+    tail_now = min(now, _midnight(end_d + _DAY))
+    last_archive = _last_ts(frames)
+    since = _midnight(start) if last_archive is None else last_archive + _MS
+    tail = pl.DataFrame(schema=dict(FUNDING_SCHEMA))
+    if since < tail_now:
+        tail = fetch_recent_funding(exchange, symbol, since, tail_now)
+        if last_archive is not None:
+            tail = tail.filter(pl.col("ts") > last_archive)
+
+    def finish(df: pl.DataFrame) -> pl.DataFrame:
+        return _bounded(df, start, end_d).filter(pl.col("ts") <= now).unique(maintain_order=True)
+
+    tail_rows = finish(tail)
+    df = pl.concat([finish(pl.concat(frames)) if frames else tail_rows.clear(), tail_rows])
+    sources = [a.file.url for a in archives.used]
+    if tail_rows.height:
+        sources.append(_FUNDING_TAG)
+    checksums = {a.file.url: a.sha256 for a in archives.used}
+    report = validate_funding(df, dataset)
+    return _result(
+        dataset,
+        report,
+        archives.missing,
+        lambda: catalog.write_funding(symbol, df, sources, checksums, now),
     )
