@@ -213,7 +213,8 @@ def test_funding_history_ok_and_zero() -> None:
     assert ctx.funding_history("AAAUSDT", 0) == ()
     out = ctx.funding_history("AAAUSDT", 5)
     assert isinstance(out, tuple)
-    assert out[0].ts == D1
+    assert out == (FundingEvent("AAAUSDT", D1, 0.0001),)
+    assert all(ev.ts <= NOW for ev in out)
     with pytest.raises(StrategyError):
         ctx.funding_history("ZZZUSDT", 1)
     with pytest.raises(StrategyError):
@@ -315,3 +316,103 @@ def test_protocol_assignments() -> None:
     assert ctx_typed.now == NOW
     assert len(hv.close) == 0
     assert pv.equity > 0
+
+
+class _Src:
+    def __init__(self, hist: object = None, funding: Sequence[FundingEvent] = ()) -> None:
+        self.hist = hist
+        self.funding = funding
+
+    def history(self, symbol: str, end: datetime, n: int) -> HistoryView:
+        return self.hist  # pyright: ignore[reportReturnType]
+
+    def funding_history(self, symbol: str, end: datetime, n: int) -> Sequence[FundingEvent]:
+        return self.funding
+
+
+def _ro(a: np.ndarray) -> np.ndarray:
+    a = a.copy()
+    a.flags.writeable = False
+    return a
+
+
+def test_toctou_ts_property_read_once() -> None:
+    good = _hist(CLOSES[:3])
+    leaked = _hist(CLOSES[:4])
+
+    class Flip:
+        def __init__(self) -> None:
+            self.reads = 0
+
+        @property
+        def ts(self) -> np.ndarray:
+            self.reads += 1
+            return good.ts if self.reads == 1 else leaked.ts
+
+        open = good.open
+        high = good.high
+        low = good.low
+        close = good.close
+        volume = good.volume
+
+    # Whatever is read first is what is checked and returned: never a second, longer read.
+    out = _ctx(_Src(Flip())).history("AAAUSDT", 3)
+    assert len(out.ts) == 3
+
+
+def test_non_datetime_ts_rejected() -> None:
+    h = _hist(CLOSES[:2])
+
+    @dataclass
+    class Ints:
+        ts: np.ndarray
+        open: np.ndarray
+        high: np.ndarray
+        low: np.ndarray
+        close: np.ndarray
+        volume: np.ndarray
+
+    bad = Ints(_ro(np.array([1, 2], dtype=np.int64)), h.open, h.high, h.low, h.close, h.volume)
+    with pytest.raises(EngineError):
+        _ctx(_Src(bad)).history("AAAUSDT", 2)
+
+
+def test_lossy_ts_cast_rejected() -> None:
+    h = _hist(CLOSES[:1])
+
+    @dataclass
+    class Ns:
+        ts: np.ndarray
+        open: np.ndarray
+        high: np.ndarray
+        low: np.ndarray
+        close: np.ndarray
+        volume: np.ndarray
+
+    ts = _ro(np.array([np.datetime64("2024-01-03T00:00:00.000000999", "ns")]))
+    bad = Ns(ts, h.open, h.high, h.low, h.close, h.volume)
+    with pytest.raises(EngineError):
+        _ctx(_Src(bad)).history("AAAUSDT", 1)
+    ok = Ns(_ro(h.ts.astype("datetime64[ns]")), h.open, h.high, h.low, h.close, h.volume)
+    assert len(_ctx(_Src(ok)).history("AAAUSDT", 1).ts) == 1
+
+
+def test_funding_wrong_symbol_or_unsorted() -> None:
+    other = [FundingEvent("BBBUSDT", D1, 0.0)]
+    with pytest.raises(EngineError):
+        _ctx(_Src(funding=other)).funding_history("AAAUSDT", 5)
+    later = FundingEvent("AAAUSDT", D1 + timedelta(hours=8), 0.0)
+    with pytest.raises(EngineError):
+        _ctx(_Src(funding=[later, FundingEvent("AAAUSDT", D1, 0.0)])).funding_history("AAAUSDT", 5)
+
+
+def test_unhashable_symbol_is_strategy_error() -> None:
+    ctx = _ctx()
+    bad: object = ["AAAUSDT"]
+    for call in (ctx.history, ctx.funding_history):
+        with pytest.raises(StrategyError):
+            call(bad, 1)  # pyright: ignore[reportArgumentType]
+    with pytest.raises(StrategyError):
+        ctx.position(bad)  # pyright: ignore[reportArgumentType]
+    with pytest.raises(StrategyError):
+        ctx.instrument(bad)  # pyright: ignore[reportArgumentType]

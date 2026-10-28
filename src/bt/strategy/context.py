@@ -3,6 +3,7 @@
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime
+from itertools import pairwise
 from typing import Protocol, cast
 
 import numpy as np
@@ -159,9 +160,16 @@ class StepContext:
     def cash(self) -> float:
         return self._portfolio.cash
 
-    def _check_args(self, symbol: str, n: int) -> None:
-        if symbol not in self._instruments:
+    def _known(self, symbol: str) -> None:
+        try:
+            known = symbol in self._instruments
+        except TypeError:
+            known = False
+        if not known:
             raise StrategyError(f"unknown symbol {symbol!r}")
+
+    def _check_args(self, symbol: str, n: int) -> None:
+        self._known(symbol)
         if isinstance(n, bool) or not isinstance(n, int):  # pyright: ignore[reportUnnecessaryIsInstance]
             raise StrategyError(f"n must be an int, got {type(n).__name__}")
         if n < 0:
@@ -172,18 +180,25 @@ class StepContext:
         if n == 0:
             return BarHistory.empty()
         raw = self._source.history(symbol, self._now, n)
-        ts = np.asarray(raw.ts).astype("datetime64[us]")
+        # Read each field exactly once: every later check runs on these locals.
+        fields = (raw.ts, raw.open, raw.high, raw.low, raw.close, raw.volume)
+        arrays = tuple(np.asarray(f) for f in fields)
+        if any(bool(a.flags.writeable) for a in arrays):
+            raise EngineError(f"history({symbol!r}) returned a writeable array")
+        raw_ts = arrays[0]
+        if not np.issubdtype(raw_ts.dtype, np.datetime64):
+            raise EngineError(f"history({symbol!r}) ts dtype {raw_ts.dtype} is not datetime64")
+        if not np.array_equal(raw_ts.astype("datetime64[us]").astype(raw_ts.dtype), raw_ts):
+            raise EngineError(f"history({symbol!r}) ts loses precision at microsecond resolution")
+        bh = BarHistory(*arrays)
         now64 = np.datetime64(self._now.replace(tzinfo=None), "us")
-        if ts.size and bool((ts > now64).any()):
+        if len(bh) and bool((bh.ts > now64).any()):
             raise LookAheadError(
                 f"history({symbol!r}) returned ts after now={self._now.isoformat()}"
             )
-        if ts.shape[0] > n:
-            raise EngineError(f"history({symbol!r}) returned {ts.shape[0]} rows for n={n}")
-        arrays = (raw.ts, raw.open, raw.high, raw.low, raw.close, raw.volume)
-        if any(bool(np.asarray(a).flags.writeable) for a in arrays):
-            raise EngineError(f"history({symbol!r}) returned a writeable array")
-        return BarHistory(raw.ts, raw.open, raw.high, raw.low, raw.close, raw.volume)
+        if len(bh) > n:
+            raise EngineError(f"history({symbol!r}) returned {len(bh)} rows for n={n}")
+        return bh
 
     def funding_history(self, symbol: str, n: int) -> Sequence[FundingEvent]:
         self._check_args(symbol, n)
@@ -196,18 +211,19 @@ class StepContext:
             )
         if len(events) > n:
             raise EngineError(f"funding_history({symbol!r}) returned {len(events)} events, n={n}")
+        if any(ev.symbol != symbol for ev in events):
+            raise EngineError(f"funding_history({symbol!r}) returned another symbol's events")
+        if any(x.ts > y.ts for x, y in pairwise(events)):
+            raise EngineError(f"funding_history({symbol!r}) events are not ascending")
         return events
 
     def position(self, symbol: str) -> PositionView:
-        if symbol not in self._instruments:
-            raise StrategyError(f"unknown symbol {symbol!r}")
+        self._known(symbol)
         return self._portfolio.position(symbol)
 
     def instrument(self, symbol: str) -> Instrument:
-        try:
-            return self._instruments[symbol]
-        except KeyError:
-            raise StrategyError(f"unknown symbol {symbol!r}") from None
+        self._known(symbol)
+        return self._instruments[symbol]
 
     def symbols(self) -> Sequence[str]:
         return tuple(sorted(self._instruments))
