@@ -47,6 +47,7 @@ FUNDING_SCHEMA: Final[Mapping[str, pl.DataType]] = MappingProxyType(
 FUNDING_INTERVAL: Final[timedelta] = timedelta(hours=8)
 
 _FUNDING_TOLERANCE: Final[timedelta] = timedelta(seconds=60)
+_FUNDING_MIN_SPACING: Final[timedelta] = timedelta(minutes=30)
 _JUMP_LIMIT: Final[float] = 0.5
 _RANGE_LIMIT: Final[float] = 1.0
 _EXTREME_RATE: Final[float] = 0.01
@@ -248,6 +249,16 @@ def validate_funding(df: pl.DataFrame, dataset: str) -> ValidationReport:
         errors += order_errors
     errors += _finite_errors(df, ["rate", "mark_price"])
     errors += _rule(df, pl.col("mark_price") <= 0, "non-positive mark_price")
+
+    if ordered:
+        min_us = _FUNDING_MIN_SPACING // _US
+        close = _diffs(df).filter((pl.col("d_us") > 0) & (pl.col("d_us") < min_us))
+        if close.height:
+            first_close: datetime = close["before_ts"][0]
+            errors.append(
+                f"funding events too close: {close.height} pairs < 30m, "
+                f"first {first_close.isoformat()}"
+            )
 
     interval_us = FUNDING_INTERVAL // _US
     limit_us = (FUNDING_INTERVAL + _FUNDING_TOLERANCE) // _US

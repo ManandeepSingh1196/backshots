@@ -297,3 +297,21 @@ def test_check_symbol_rejects(bad: str) -> None:
     with pytest.raises(DataError) as exc:
         check_symbol(bad)
     assert repr(bad) in str(exc.value) or bad in str(exc.value)
+
+
+def test_funding_events_too_close() -> None:
+    base = datetime(2024, 2, 29, 16, tzinfo=UTC)
+    r = validate_funding(funding([{"ts": base}, {"ts": base + timedelta(milliseconds=3)}]), "x")
+    assert not r.ok
+    assert "too close: 1 pairs" in r.errors[0]
+    assert "2024-02-29T16:00:00.003000+00:00" in r.errors[0]
+
+
+def test_funding_min_spacing_boundaries() -> None:
+    def pair(delta: timedelta) -> pl.DataFrame:
+        return funding([{"ts": T0}, {"ts": T0 + delta}])
+
+    assert not validate_funding(pair(timedelta(minutes=29, seconds=59)), "x").ok
+    assert validate_funding(pair(timedelta(minutes=30)), "x").ok
+    assert validate_funding(pair(timedelta(hours=1)), "x").ok
+    assert validate_funding(fund_ts([8.0 * i for i in range(9)]), "x").ok
