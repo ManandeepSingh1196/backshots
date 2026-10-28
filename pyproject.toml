@@ -18,6 +18,9 @@ dependencies = [
     "typer>=0.27.3",
 ]
 
+[project.scripts]
+bt = "bt.cli.main:app"
+
 [build-system]
 requires = ["uv_build>=0.9.0,<0.14"]
 build-backend = "uv_build"
@@ -48,7 +51,7 @@ select = ["E", "W", "F", "I", "UP", "B", "SIM", "RUF", "DTZ", "ANN", "PT", "N"]
 [tool.pyright]
 typeCheckingMode = "strict"
 pythonVersion = "3.12"
-include = ["src", "tests"]
+include = ["src", "strategies", "tests"]
 exclude = [".worktrees", ".venv", "data", "runs", "**/__pycache__"]
 venvPath = "."
 venv = ".venv"
