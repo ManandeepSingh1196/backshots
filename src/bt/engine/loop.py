@@ -52,7 +52,7 @@ class EngineConfig:
 
     def __post_init__(self) -> None:
         k = self.max_drawdown_kill
-        if k is not None and not (math.isfinite(k) and 0 < k <= 1):
+        if k is not None and (isinstance(k, bool) or not (math.isfinite(k) and 0 < k <= 1)):
             raise EngineError(f"max_drawdown_kill must be None or in (0, 1], got {k!r}")
         if not math.isfinite(self.rebalance_band) or self.rebalance_band < 0:
             raise EngineError(
@@ -108,10 +108,12 @@ class _ReservingView:
             return
         inst = self._inst[order.symbol]
         if order.type == OrderType.LIMIT:
-            assert order.limit_price is not None
+            if order.limit_price is None:
+                raise EngineError(f"limit order {order.id} has no limit_price")
             p = order.limit_price
         elif order.type == OrderType.STOP:
-            assert order.stop_price is not None
+            if order.stop_price is None:
+                raise EngineError(f"stop order {order.id} has no stop_price")
             p = order.stop_price
         else:
             p = self._last_close[order.symbol]
@@ -147,7 +149,7 @@ class _ReservingView:
 
 
 def _guard[**P, T](
-    what: str, ts: datetime, fn: Callable[P, T], *args: P.args, **kwargs: P.kwargs
+    what: str, ts: datetime | None, fn: Callable[P, T], *args: P.args, **kwargs: P.kwargs
 ) -> T:
     """Run strategy code; BtErrors pass through, anything else becomes a StrategyError."""
     try:
@@ -155,9 +157,8 @@ def _guard[**P, T](
     except BtError:
         raise
     except Exception as exc:
-        raise StrategyError(
-            f"{what} raised {type(exc).__name__}: {exc} at {ts.isoformat()}"
-        ) from exc
+        where = "" if ts is None else f" at {ts.isoformat()}"
+        raise StrategyError(f"{what} raised {type(exc).__name__}: {exc}{where}") from exc
 
 
 def _apply(fills: Sequence[Fill], portfolio: Portfolio, log: EventLog) -> None:
@@ -167,17 +168,17 @@ def _apply(fills: Sequence[Fill], portfolio: Portfolio, log: EventLog) -> None:
         # M8: tax hook here
 
 
-def _check_wiring(strategy: Strategy, feed: DataFeed) -> tuple[Instrument, ...]:
+def _check_wiring(strategy: Strategy, feed: DataFeed) -> tuple[tuple[Instrument, ...], int]:
     feed_insts = tuple(sorted(feed.instruments(), key=lambda i: i.symbol))
     if tuple(sorted(strategy.instruments, key=lambda i: i.symbol)) != feed_insts:
         raise EngineError("strategy instruments differ from feed instruments")
     for inst in feed_insts:
         if inst.kind != InstrumentKind.SPOT:
             raise EngineError(f"{inst.symbol}: only spot is supported; perps arrive in M6")
-    warmup = cast("object", strategy.warmup_bars())
+    warmup = cast("object", _guard("warmup_bars", None, strategy.warmup_bars))
     if isinstance(warmup, bool) or not isinstance(warmup, int) or warmup < 0:
         raise StrategyError(f"warmup_bars must be an int >= 0, got {warmup!r}")
-    return feed_insts
+    return feed_insts, warmup
 
 
 def _market_sells(portfolio: Portfolio, prefix: str, ts: datetime, tag: str) -> list[Order]:
@@ -196,9 +197,8 @@ def run_engine(
     config: EngineConfig,
 ) -> EngineResult:
     """Run the DESIGN section 5 loop over every step of `feed` and return the result."""
-    instruments = _check_wiring(strategy, feed)
+    instruments, warmup = _check_wiring(strategy, feed)
     inst_by_sym = {i.symbol: i for i in instruments}
-    warmup = strategy.warmup_bars()
     peak = portfolio.equity
     killed_at: datetime | None = None
     seen: set[str] = set()
@@ -296,7 +296,7 @@ def _submit_intent(
     if isinstance(raw, NoAction):
         return
     if isinstance(raw, TargetWeights):
-        raise StrategyError("TargetWeights needs the M5 rebalancer")
+        raise StrategyError(f"TargetWeights needs the M5 rebalancer (at {ts.isoformat()})")
     if not isinstance(raw, Orders):
         raise StrategyError(f"on_bar returned {type(raw).__name__}, not an Intent")
     view = _ReservingView(portfolio.view(), inst_by_sym, last_close)
