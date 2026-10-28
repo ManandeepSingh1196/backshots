@@ -1,0 +1,29 @@
+{
+  "files": {
+    "binance/spot/klines/1d/AAAUSDT.parquet": {
+      "checksums": {},
+      "first_ts": "2024-01-01T00:00:00+00:00",
+      "ingested_at": "2024-02-01T00:00:00+00:00",
+      "last_ts": "2024-01-05T00:00:00+00:00",
+      "path": "binance/spot/klines/1d/AAAUSDT.parquet",
+      "rows": 5,
+      "sha256": "9e3b517c3d5c4071da7ef1f9a2420e1ce6a0528e7e3ff22d68c95b540054b126",
+      "sources": [
+        "golden"
+      ]
+    },
+    "binance/spot/klines/1d/BBBUSDT.parquet": {
+      "checksums": {},
+      "first_ts": "2024-01-01T00:00:00+00:00",
+      "ingested_at": "2024-02-01T00:00:00+00:00",
+      "last_ts": "2024-01-05T00:00:00+00:00",
+      "path": "binance/spot/klines/1d/BBBUSDT.parquet",
+      "rows": 4,
+      "sha256": "0632efa4ef62e9717a8a9d3d6c319b20385481ad4d25e5187c06393ca94fda3d",
+      "sources": [
+        "golden"
+      ]
+    }
+  },
+  "version": 1
+}

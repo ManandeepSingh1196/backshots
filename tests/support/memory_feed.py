@@ -1,4 +1,4 @@
-"""In-memory DataFeed with the same look-ahead guard as ParquetFeed."""
+"""In-memory DataFeed with the same look-ahead guard as ParquetFeed (funding: perps only)."""
 
 from collections.abc import Iterator, Sequence
 from datetime import datetime
@@ -7,7 +7,7 @@ import numpy as np
 
 from bt.core.clock import ensure_utc
 from bt.core.errors import DataError, LookAheadError
-from bt.core.types import Bar, FundingEvent, Instrument, Step
+from bt.core.types import Bar, FundingEvent, Instrument, InstrumentKind, Step
 from bt.strategy.context import BarHistory, HistoryView
 
 
@@ -23,6 +23,7 @@ class MemoryFeed:
     ) -> None:
         self._instruments = tuple(sorted(instruments, key=lambda i: i.symbol))
         symbols = {i.symbol for i in self._instruments}
+        perps = {i.symbol for i in self._instruments if i.kind == InstrumentKind.PERP}
         by_sym: dict[str, dict[datetime, Bar]] = {s: {} for s in sorted(symbols)}
         for bar in bars:
             if bar.symbol not in symbols:
@@ -32,7 +33,9 @@ class MemoryFeed:
             by_sym[bar.symbol][bar.ts] = bar
         self._bars = {s: [b[t] for t in sorted(b)] for s, b in by_sym.items()}
         self._funding = {
-            s: tuple(sorted((e for e in funding if e.symbol == s), key=lambda e: e.ts))
+            s: tuple(
+                sorted((e for e in funding if e.symbol == s and s in perps), key=lambda e: e.ts)
+            )
             for s in sorted(symbols)
         }
         step_ts = sorted({b.ts for lst in self._bars.values() for b in lst})

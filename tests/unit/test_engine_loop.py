@@ -206,6 +206,7 @@ def test_kill_at_exact_boundary() -> None:
         [1000, 900, 600, 550, 550], abs=1e-9
     )
     assert r.strategy.calls == [d(1), d(2)]
+    assert r.strategy.fills_seen == [r.result.fills[0]]  # no on_fill after the kill
     (msg,) = [m for m in r.result.messages if m.message == "kill_switch"]
     assert msg.ts == d(3)
     assert dict(msg.fields)["drawdown"] == pytest.approx(0.4, abs=1e-12)
@@ -432,3 +433,104 @@ def test_noaction_default_and_single_step() -> None:
     assert r.result.fills == ()
     assert [e.equity for e in r.result.equity] == pytest.approx([1000], abs=1e-9)
     assert isinstance(NoAction(), NoAction)
+
+
+def make_engine(
+    strat: ScriptedStrategy, bars: Sequence[Bar], insts: Sequence[Instrument] = (AAA,)
+) -> EngineResult:
+    log = EventLog()
+    pf = Portfolio(1000.0, insts)
+    broker = BrokerSim(insts, VenueFees(), FixedBps(0), pf.view(), log)
+    return run_engine(strat, MemoryFeed(insts, bars), broker, pf, log, EngineConfig())
+
+
+class BadWarmup(Hooked):
+    def __init__(self, value: object) -> None:
+        super().__init__((AAA,), {})
+        self.value = value
+
+    def warmup_bars(self) -> int:
+        return self.value  # type: ignore[return-value]  # deliberately invalid
+
+
+class CountingWarmup(Hooked):
+    def __init__(self) -> None:
+        super().__init__((AAA,), {})
+        self.n = 0
+
+    def warmup_bars(self) -> int:
+        self.n += 1
+        if self.n > 1:
+            raise AssertionError("warmup_bars called twice")
+        return 0
+
+
+class RaisingWarmup(Hooked):
+    def warmup_bars(self) -> int:
+        raise ValueError("no warmup")
+
+
+@pytest.mark.parametrize("value", [-1, "3"])
+def test_bad_warmup_bars(value: object) -> None:
+    with pytest.raises(StrategyError, match="warmup_bars"):
+        make_engine(BadWarmup(value), [flat(A, 1, 100)])
+
+
+def test_warmup_bars_called_once_and_guarded() -> None:
+    strat = CountingWarmup()
+    make_engine(strat, [flat(A, i, 100) for i in range(1, 4)])
+    assert strat.n == 1
+    with pytest.raises(StrategyError, match="no warmup") as ei:
+        make_engine(RaisingWarmup((AAA,), {}), [flat(A, 1, 100)])
+    assert isinstance(ei.value.__cause__, ValueError)
+
+
+class RaisesOnFill(Hooked):
+    def on_fill(self, fill: object, ctx: Context) -> None:  # type: ignore[override]
+        raise ValueError("fill boom")
+
+
+class RaisesOnStart(Hooked):
+    def on_start(self, ctx: Context) -> None:
+        raise ValueError("start boom")
+
+
+def test_hook_exceptions_become_strategy_errors() -> None:
+    bars = [flat(A, i, 100) for i in range(1, 4)]
+    with pytest.raises(StrategyError, match="fill boom") as ei:
+        make_engine(RaisesOnFill((AAA,), {d(1): [buy("b1")]}), bars)
+    assert isinstance(ei.value.__cause__, ValueError)
+    with pytest.raises(StrategyError, match="start boom") as ei2:
+        make_engine(RaisesOnStart((AAA,), {}), bars)
+    assert isinstance(ei2.value.__cause__, ValueError)
+
+
+def test_kill_cancels_strategy_limit_before_kill_sell() -> None:
+    lim = Order("l1", A, Side.BUY, 1.0, OrderType.LIMIT, limit_price=50.0)
+    script = {d(1): [buy("b1", qty=9)], d(2): [lim]}
+    r = run(KILL_BARS, script, config=EngineConfig(max_drawdown_kill=0.30))
+    assert r.result.killed_at == d(3)
+    assert records(r, "l1") == [
+        (d(2), OrderStatus.NEW, ""),
+        (d(3), OrderStatus.CANCELED, "kill_switch"),
+    ]
+    kill_fill = next(f for f in r.result.fills if f.order_id.startswith("bt-kill"))
+    assert kill_fill.ts == d(4)
+
+
+def test_target_weights_message_has_ts() -> None:
+    with pytest.raises(StrategyError, match="2024-01-01"):
+        run([flat(A, 1, 100)], {}, hook=lambda ctx: TargetWeights({A: 0.5}), check=False)
+
+
+def test_kill_threshold_rejects_bool() -> None:
+    with pytest.raises(EngineError):
+        EngineConfig(max_drawdown_kill=True)
+
+
+def test_memory_feed_no_funding_on_spot() -> None:
+    from bt.core.types import FundingEvent
+
+    feed = MemoryFeed((AAA,), [flat(A, 1, 100), flat(A, 2, 100)], [FundingEvent(A, d(1), 0.0001)])
+    assert [s.funding for s in feed.steps()] == [(), ()]
+    assert feed.funding_history(A, d(5), 10) == ()
