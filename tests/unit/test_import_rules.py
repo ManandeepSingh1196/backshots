@@ -62,6 +62,8 @@ def _imported_modules(tree: ast.AST, module: str, is_pkg: bool) -> list[str]:
                 base = node.module or ""
             else:
                 parts = package.split(".") if package else []
+                if node.level - 1 >= len(parts):
+                    continue  # climbs above the top-level package: unresolvable, ignored
                 parts = parts[: len(parts) - (node.level - 1)]
                 base = ".".join([*parts, *([node.module] if node.module else [])])
             if node.module is None or base == "bt":
@@ -187,14 +189,13 @@ def test_checker_hardening_single_violation(
     assert target in violations[0]
 
 
-def test_three_level_relative_import_above_top_level_is_flagged(tmp_path: Path) -> None:
-    # `from ...bt.engine import x` in bt/core/a.py climbs above the top-level package
-    # (invalid at runtime). Documented behavior: the checker resolves it to bt.engine
-    # and flags it, which is the conservative choice.
-    _write(tmp_path, "src/bt/core/a.py", "from ...bt.engine import x\n")
-    violations = _run(tmp_path)
-    assert len(violations) == 1
-    assert "bt.engine" in violations[0]
+@pytest.mark.parametrize("code", ["from ...bt.engine import x\n", "from ....engine import x\n"])
+def test_relative_import_above_top_level_is_ignored(tmp_path: Path, code: str) -> None:
+    # In bt/core/a.py, `...` already climbs above the top-level `bt` package (invalid at
+    # runtime, and not resolvable to an internal module). Documented behavior: the checker
+    # clamps and ignores such imports instead of mis-resolving them (no violation).
+    _write(tmp_path, "src/bt/core/a.py", code)
+    assert _run(tmp_path) == []
 
 
 def test_checker_allows_same_package_relative_imports(tmp_path: Path) -> None:
