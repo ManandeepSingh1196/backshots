@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import socket
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from datetime import UTC, datetime, timedelta
 from typing import cast
 
@@ -38,8 +38,8 @@ def D(day: int) -> datetime:  # noqa: N802
 
 
 @pytest.fixture(autouse=True)
-def _no_retry_wait(monkeypatch: pytest.MonkeyPatch) -> None:  # pyright: ignore[reportUnusedFunction]
-    monkeypatch.setattr(fc, "_RETRY_WAIT_S", 0.0)
+def no_retry_wait(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(fc, "_retry_wait", lambda: 0.0)
 
 
 def bars(start: datetime, n: int, step: timedelta) -> list[list[object]]:
@@ -395,3 +395,31 @@ def test_make_exchange_is_offline_and_keyless(monkeypatch: pytest.MonkeyPatch) -
     assert getattr(ex, "enableRateLimit", False)
     options = cast(dict[str, object], getattr(ex, "options"))  # noqa: B009
     assert cast(dict[str, object], options["fetchMarkets"])["types"] == ["spot", "linear"]
+
+
+def test_maint_margin_not_numeric() -> None:
+    m = perp_market()
+    m["info"] = {"maintMarginPercent": "abc"}
+    with pytest.raises(DataError, match="maintMarginPercent"):
+        fetch_instruments(FakeExchange([m]), "perp", ["BTCUSDT"])
+
+
+def test_swap_with_linear_false_excluded_for_perp() -> None:
+    m = perp_market()
+    m["linear"] = False
+    with pytest.raises(DataError, match="BTCUSDT"):
+        fetch_instruments(FakeExchange([m]), "perp", ["BTCUSDT"])
+
+
+def test_pagination_that_does_not_advance_raises() -> None:
+    page = bars(D(1), 1000, timedelta(minutes=1))
+
+    class Stuck(FakeExchange):
+        def publicGetKlines(self, params: Mapping[str, object]) -> list[list[object]]:  # noqa: N802
+            self.calls.append(("publicGetKlines", dict(params)))
+            return page
+
+    fake = Stuck()
+    with pytest.raises(DataError, match="advance"):
+        fetch_recent_klines(fake, "spot", "1d", "BTCUSDT", D(1), D(30))
+    assert len(fake.calls) == 2

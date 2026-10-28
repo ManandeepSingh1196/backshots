@@ -29,7 +29,7 @@ from bt.data.validate import (
 
 PAGE_LIMIT: Final = 1000
 MAX_ATTEMPTS: Final = 3
-_RETRY_WAIT_S: float = 1.0  # tests patch this to 0
+_RETRY_WAIT_S: Final = 1.0
 
 _T = TypeVar("_T")
 
@@ -136,6 +136,11 @@ def fetch_instruments(
 # --------------------------------------------------------------------------- retry / paging
 
 
+def _retry_wait() -> float:
+    """Seconds to wait between retries (tests monkeypatch this to 0)."""
+    return _RETRY_WAIT_S
+
+
 def _call(fn: Callable[[], _T]) -> _T:
     """Run `fn`, retrying ccxt.NetworkError up to MAX_ATTEMPTS; ccxt errors become DataError."""
     for attempt in range(1, MAX_ATTEMPTS + 1):
@@ -144,7 +149,7 @@ def _call(fn: Callable[[], _T]) -> _T:
         except ccxt.NetworkError as exc:
             if attempt == MAX_ATTEMPTS:
                 raise DataError(f"network error after {MAX_ATTEMPTS} attempts: {exc}") from exc
-            time.sleep(_RETRY_WAIT_S)
+            time.sleep(_retry_wait())
         except ccxt.BaseError as exc:
             raise DataError(f"exchange error: {exc}") from exc
     raise AssertionError("unreachable")  # pragma: no cover
@@ -184,7 +189,7 @@ def _paginate(
         if not page:
             break
         rows.extend(page)
-        last = open_ms(page[-1])
+        last = max(open_ms(r) for r in page)
         if len(page) < PAGE_LIMIT or last >= now_ms:
             break
         if last < start:
