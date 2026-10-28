@@ -318,3 +318,9 @@ class Step:
                 ev.ts <= self.ts,
                 f"Step {self.ts.isoformat()}: funding {ev.symbol} at {ev.ts.isoformat()} is later",
             )
+
+    def __reduce__(
+        self,
+    ) -> tuple[type["Step"], tuple[datetime, dict[str, Bar], tuple[FundingEvent, ...]]]:
+        # MappingProxyType is not picklable; rebuild through __init__ so invariants re-run.
+        return (Step, (self.ts, dict(self.bars), tuple(self.funding)))
