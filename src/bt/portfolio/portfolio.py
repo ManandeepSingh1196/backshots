@@ -119,7 +119,8 @@ class Portfolio:
             trade_pnl = 0.0
         else:
             new_qty = pos.qty - fill.qty
-            tol = _QTY_REL_TOL * max(step, abs(pos.qty)) + math.ulp(pos.qty)
+            # Capped at half a step so a whole-step oversell is never forgiven.
+            tol = min(_QTY_REL_TOL * max(step, abs(pos.qty)) + math.ulp(pos.qty), 0.5 * step)
             if new_qty < -tol:
                 raise PortfolioError(
                     f"fill {fill.order_id}: sell {fill.qty!r} exceeds holding {pos.qty!r}"

@@ -241,3 +241,12 @@ def test_mark_stores_float() -> None:
     p.apply_fill(fill("AAAUSDT", Side.BUY, 1.0, 100.0, 0.0))
     p.mark(T1, {"AAAUSDT": np.float64(110.0)})
     assert type(p._marks["AAAUSDT"]) is float  # pyright: ignore[reportPrivateUsage]
+
+
+def test_oversell_by_a_whole_step_rejected_at_huge_qty() -> None:
+    big = inst("CCCUSDT", 1.0)
+    p = Portfolio(1e12, [big])
+    p.apply_fill(fill("CCCUSDT", Side.BUY, 1e9, 1.0, 0.0))
+    with pytest.raises(PortfolioError):
+        p.apply_fill(fill("CCCUSDT", Side.SELL, 1e9 + 1.0, 1.0, 0.0))
+    assert p.position("CCCUSDT").qty == 1e9
