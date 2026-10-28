@@ -73,7 +73,7 @@ def test_accounting_invariants(
     ops: list[tuple[str, str, int, float, float, float, int, float]],
 ) -> None:
     p = _new()
-    held = dict.fromkeys(SYMS, 0)  # integer steps held
+    held: dict[str, int] = dict.fromkeys(SYMS, 0)
     ts = T0
     expected_cash = START
     notional_sum = 0.0
@@ -145,7 +145,7 @@ def test_zero_fee_same_price_round_trip_is_flat_cash(
     price: float, ops: list[tuple[str, int, bool]]
 ) -> None:
     p = _new()
-    held = dict.fromkeys(SYMS, 0)
+    held: dict[str, int] = dict.fromkeys(SYMS, 0)
     notional = 0.0
     for i, (sym, nsteps, is_buy) in enumerate(ops):
         step = STEPS[sym]
