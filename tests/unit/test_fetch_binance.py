@@ -3,9 +3,11 @@ from __future__ import annotations
 from datetime import date
 from pathlib import Path
 
+import httpx
 import pytest
 
 from bt.core.errors import ArchiveError, ChecksumMismatchError, DataError
+from bt.data import fetch_binance
 from bt.data.fetch_binance import (
     daily_kline_archive_files,
     download_archive,
@@ -16,6 +18,7 @@ from tests.support.binance_archive import (
     ArchiveServer,
     build_checksum,
     build_csv_zip,
+    build_zip,
     sha256_hex,
 )
 
@@ -190,3 +193,113 @@ def test_zip_404_with_checksum_raises(tmp_path: Path) -> None:
     server = ArchiveServer({FILE.checksum_url: (200, build_checksum(z, FNAME))})
     with server.client() as c, pytest.raises(ArchiveError, match="404"):
         download_archive(c, FILE, tmp_path)
+
+
+# --- retries and error handling --------------------------------------------------------
+
+
+@pytest.fixture
+def no_backoff(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(fetch_binance, "_BACKOFF_SECONDS", 0.0)
+
+
+def _flaky(statuses: list[int], tmp_path: Path) -> tuple[ArchiveServer, bytes]:
+    z = build_csv_zip(CSV)
+    server = ArchiveServer(
+        {
+            FILE.checksum_url: (200, build_checksum(z, FNAME)),
+            FILE.url: [*[(s, b"") for s in statuses], (200, z)],
+        }
+    )
+    return server, z
+
+
+@pytest.mark.usefixtures("no_backoff")
+def test_two_503_then_success(tmp_path: Path) -> None:
+    server, _ = _flaky([503, 503], tmp_path)
+    with server.client() as c:
+        assert download_archive(c, FILE, tmp_path) is not None
+    assert server.request_count == 4  # checksum + 3 zip attempts
+
+
+@pytest.mark.usefixtures("no_backoff")
+def test_429_is_retried(tmp_path: Path) -> None:
+    server, _ = _flaky([429], tmp_path)
+    with server.client() as c:
+        assert download_archive(c, FILE, tmp_path) is not None
+
+
+@pytest.mark.usefixtures("no_backoff")
+def test_three_503_raises_archive_error(tmp_path: Path) -> None:
+    server, _ = _flaky([503, 503, 503], tmp_path)
+    with server.client() as c, pytest.raises(ArchiveError, match="3 attempts"):
+        download_archive(c, FILE, tmp_path)
+    assert server.requested_urls.count(FILE.url) == 3
+
+
+@pytest.mark.usefixtures("no_backoff")
+def test_403_fails_immediately(tmp_path: Path) -> None:
+    server = ArchiveServer({FILE.checksum_url: (403, b"")})
+    with server.client() as c, pytest.raises(ArchiveError, match="403"):
+        download_archive(c, FILE, tmp_path)
+    assert server.request_count == 1
+
+
+@pytest.mark.usefixtures("no_backoff")
+def test_transport_error_retried_then_chained(tmp_path: Path) -> None:
+    calls = 0
+
+    def boom(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        raise httpx.ConnectError("down", request=request)
+
+    with (
+        httpx.Client(transport=httpx.MockTransport(boom)) as c,
+        pytest.raises(ArchiveError) as exc,
+    ):
+        download_archive(c, FILE, tmp_path)
+    assert calls == 3
+    assert exc.value.__cause__ is not None
+    assert isinstance(exc.value.__cause__.__cause__, httpx.ConnectError)
+
+
+def test_malformed_checksum_raises(tmp_path: Path) -> None:
+    z = build_csv_zip(CSV)
+    server = ArchiveServer({FILE.url: (200, z), FILE.checksum_url: (200, b"not-a-digest  file\n")})
+    with server.client() as c, pytest.raises(ArchiveError, match="malformed"):
+        download_archive(c, FILE, tmp_path)
+
+
+def test_checksum_without_trailing_newline_ok(tmp_path: Path) -> None:
+    z = build_csv_zip(CSV)
+    server = ArchiveServer(
+        {
+            FILE.url: (200, z),
+            FILE.checksum_url: (200, build_checksum(z, FNAME, trailing_newline=False)),
+        }
+    )
+    with server.client() as c:
+        assert download_archive(c, FILE, tmp_path) is not None
+
+
+def _download_zip(tmp_path: Path, z: bytes) -> None:
+    server, _ = _serve(z)
+    with server.client() as c:
+        download_archive(c, FILE, tmp_path)
+
+
+def test_zip_with_two_csv_members_raises(tmp_path: Path) -> None:
+    with pytest.raises(ArchiveError, match="exactly one CSV"):
+        _download_zip(tmp_path, build_zip({"a.csv": b"1\n", "b.csv": b"2\n"}))
+    assert [p for p in tmp_path.rglob("*") if p.is_file()] == []
+
+
+def test_zip_with_no_csv_member_raises(tmp_path: Path) -> None:
+    with pytest.raises(ArchiveError, match="exactly one CSV"):
+        _download_zip(tmp_path, build_zip({"a.txt": b"1\n"}))
+
+
+def test_corrupt_zip_raises(tmp_path: Path) -> None:
+    with pytest.raises(ArchiveError, match="corrupt zip"):
+        _download_zip(tmp_path, b"this is not a zip")
