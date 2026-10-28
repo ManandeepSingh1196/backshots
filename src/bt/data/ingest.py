@@ -7,8 +7,9 @@ a dataset that fails validation is reported and left unstored.
 from __future__ import annotations
 
 import calendar
+import hashlib
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import Final
@@ -28,7 +29,13 @@ from bt.data.fetch_binance import (
     parse_funding_csv,
     parse_klines_csv,
 )
-from bt.data.fetch_ccxt import CcxtExchange, fetch_recent_funding, fetch_recent_klines
+from bt.core.types import Instrument
+from bt.data.fetch_ccxt import (
+    CcxtExchange,
+    fetch_instruments,
+    fetch_recent_funding,
+    fetch_recent_klines,
+)
 from bt.data.validate import (
     FUNDING_SCHEMA,
     KLINE_SCHEMA,
@@ -36,6 +43,7 @@ from bt.data.validate import (
     Market,
     Timeframe,
     ValidationReport,
+    check_symbol,
     validate_funding,
     validate_klines,
 )
@@ -251,3 +259,80 @@ def ingest_funding(
         archives.missing,
         lambda: catalog.write_funding(symbol, df, sources, checksums, now),
     )
+
+
+def ingest_instruments(
+    catalog: Catalog,
+    exchange: CcxtExchange,
+    symbols: Sequence[str],
+    markets: Sequence[Market],
+    now: datetime,
+) -> list[Instrument]:
+    """Fetch instrument rules for `symbols` on each market and store one snapshot at `now`."""
+    now = ensure_utc(now, "now")
+    for symbol in symbols:
+        check_symbol(symbol)
+    found: list[Instrument] = []
+    for market in markets:
+        found.extend(fetch_instruments(exchange, market, symbols))
+    found.sort(key=lambda i: i.symbol)
+    catalog.write_instruments(found, fetched_at=now)
+    return found
+
+
+def _failed(dataset: str, error: str) -> ValidationReport:
+    return ValidationReport(dataset, 0, None, None, (error,), (), ())
+
+
+def _dataset_name(rel: str) -> str:
+    """"binance/perp/klines/1d/BTCUSDT.parquet" -> "perp/klines/1d/BTCUSDT"."""
+    return rel.removeprefix("binance/").removesuffix(".parquet")
+
+
+def _validate_stored(rel: str, df: pl.DataFrame) -> ValidationReport:
+    dataset = _dataset_name(rel)
+    parts = dataset.split("/")
+    if len(parts) == 4 and parts[1] == "klines" and parts[2] in TIMEFRAME_DELTA:
+        timeframe: Timeframe = "1d" if parts[2] == "1d" else "4h"
+        return validate_klines(df, timeframe, dataset)
+    if len(parts) == 3 and parts[1] == "funding":
+        return validate_funding(df, dataset)
+    return _failed(dataset, "unrecognized dataset path")
+
+
+def _check_entry(root: Path, entry: ManifestEntry) -> ValidationReport:
+    dataset = _dataset_name(entry.path)
+    path = root / entry.path
+    if not path.is_file():
+        return _failed(dataset, "missing file")
+    try:
+        raw = path.read_bytes()
+        df = pl.read_parquet(path)
+    except (pl.exceptions.PolarsError, OSError) as e:
+        return _failed(dataset, f"cannot read file: {e}")
+    report = _validate_stored(entry.path, df)
+    checks: list[tuple[str, object, object]] = [
+        ("rows", entry.rows, report.rows),
+        ("first_ts", entry.first_ts, report.first_ts),
+        ("last_ts", entry.last_ts, report.last_ts),
+        ("sha256", entry.sha256, hashlib.sha256(raw).hexdigest()),
+    ]
+    mismatches = tuple(
+        f"manifest mismatch: {name} {stored} != {actual}"
+        for name, stored, actual in checks
+        if stored != actual
+    )
+    return replace(report, errors=report.errors + mismatches)
+
+
+def check_catalog(catalog: Catalog) -> list[ValidationReport]:
+    """Re-validate every manifest entry against its file; flag Parquet files not in the manifest."""
+    manifest = catalog.manifest()
+    reports = [_check_entry(catalog.root, e) for e in manifest.values()]
+    data_root = catalog.root / "binance"
+    if data_root.is_dir():
+        for path in data_root.rglob("*.parquet"):
+            rel = path.relative_to(catalog.root).as_posix()
+            if rel not in manifest:
+                reports.append(_failed(_dataset_name(rel), "not in manifest"))
+    return sorted(reports, key=lambda r: r.dataset)

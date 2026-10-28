@@ -17,7 +17,13 @@ from bt.data.fetch_binance import (
     funding_archive_files,
     kline_archive_files,
 )
-from bt.data.ingest import IngestResult, ingest_funding, ingest_klines
+from bt.data.ingest import (
+    IngestResult,
+    check_catalog,
+    ingest_funding,
+    ingest_instruments,
+    ingest_klines,
+)
 from bt.data.validate import Gap
 from tests.support.binance_archive import (
     ArchiveServer,
@@ -25,7 +31,14 @@ from tests.support.binance_archive import (
     build_checksum,
     build_csv_zip,
 )
-from tests.support.fake_exchange import FakeExchange, epoch_ms, funding_row, kline_row
+from tests.support.fake_exchange import (
+    FakeExchange,
+    epoch_ms,
+    funding_row,
+    kline_row,
+    perp_market,
+    spot_market,
+)
 
 DAY = timedelta(days=1)
 NOW = datetime(2024, 3, 10, 1, 0, tzinfo=UTC)
@@ -400,3 +413,124 @@ def test_funding_end_excludes_tail_events_after_end(catalog: Catalog) -> None:
 def test_funding_naive_now_raises(catalog: Catalog) -> None:
     with pytest.raises(TimezoneError):
         run_funding(catalog, {}, FakeExchange(), now=datetime(2024, 3, 10, 1, 0))  # noqa: DTZ001
+
+
+# --------------------------------------------------------------------------- instruments
+
+
+def test_ingest_instruments_writes_sorted_snapshot(catalog: Catalog) -> None:
+    fake = FakeExchange(markets=[spot_market(), perp_market()])
+    out = ingest_instruments(catalog, fake, ["BTCUSDT"], ["spot", "perp"], NOW)
+    assert [i.symbol for i in out] == ["BTCUSDT", "BTCUSDT-PERP"]
+    stored, fetched_at = catalog.read_instruments()
+    assert [i.symbol for i in stored] == ["BTCUSDT", "BTCUSDT-PERP"]
+    assert fetched_at == NOW
+
+
+def test_ingest_instruments_naive_now_raises(catalog: Catalog) -> None:
+    fake = FakeExchange(markets=[spot_market()])
+    with pytest.raises(TimezoneError):
+        ingest_instruments(catalog, fake, ["BTCUSDT"], ["spot"], datetime(2024, 3, 10))  # noqa: DTZ001
+    assert not (catalog.root / "instruments.json").exists()
+
+
+# --------------------------------------------------------------------------- check_catalog
+
+SCHEMA = {
+    "ts": pl.Datetime("us", "UTC"),
+    "open": pl.Float64(),
+    "high": pl.Float64(),
+    "low": pl.Float64(),
+    "close": pl.Float64(),
+    "volume": pl.Float64(),
+    "quote_volume": pl.Float64(),
+    "trades": pl.Int64(),
+}
+
+
+def small_klines(n: int) -> pl.DataFrame:
+    ds = days(date(2024, 1, 1), date(2024, 1, 1) + timedelta(days=n - 1))
+    return pl.DataFrame(
+        {
+            "ts": [at(d) for d in ds],
+            "open": [10.0] * n,
+            "high": [12.0] * n,
+            "low": [9.0] * n,
+            "close": [11.0] * n,
+            "volume": [1.0] * n,
+            "quote_volume": [11.0] * n,
+            "trades": [3] * n,
+        },
+        schema=SCHEMA,
+    )
+
+
+@pytest.fixture
+def two_datasets(catalog: Catalog) -> Catalog:
+    catalog.write_klines("perp", "1d", "BTCUSDT", small_klines(5), ["s"], {"s": "0" * 64}, NOW)
+    catalog.write_klines("spot", "1d", "ETHUSDT", small_klines(4), [], {}, NOW)
+    return catalog
+
+
+def test_check_catalog_clean(two_datasets: Catalog) -> None:
+    reports = check_catalog(two_datasets)
+    assert [r.dataset for r in reports] == ["perp/klines/1d/BTCUSDT", "spot/klines/1d/ETHUSDT"]
+    assert all(r.ok for r in reports)
+    assert [r.rows for r in reports] == [5, 4]
+
+
+def test_check_catalog_empty_root(catalog: Catalog) -> None:
+    assert check_catalog(catalog) == []
+
+
+def test_check_catalog_row_dropped_behind_its_back(two_datasets: Catalog) -> None:
+    path = two_datasets.klines_path("perp", "1d", "BTCUSDT")
+    small_klines(5).head(4).write_parquet(path)
+    reports = check_catalog(two_datasets)
+    bad = reports[0]
+    assert "manifest mismatch: rows 5 != 4" in bad.errors
+    assert any(e.startswith("manifest mismatch: last_ts") for e in bad.errors)
+    assert any(e.startswith("manifest mismatch: sha256") for e in bad.errors)
+    assert reports[1].ok
+
+
+def test_check_catalog_detects_changed_close_by_sha(two_datasets: Catalog) -> None:
+    path = two_datasets.klines_path("perp", "1d", "BTCUSDT")
+    df = pl.read_parquet(path)
+    df.with_columns(
+        pl.when(pl.col("ts") == df["ts"][2]).then(11.5).otherwise(pl.col("close")).alias("close")
+    ).write_parquet(path)
+    bad = check_catalog(two_datasets)[0]
+    assert len(bad.errors) == 1
+    assert bad.errors[0].startswith("manifest mismatch: sha256")
+
+
+def test_check_catalog_missing_file(two_datasets: Catalog) -> None:
+    two_datasets.klines_path("spot", "1d", "ETHUSDT").unlink()
+    reports = check_catalog(two_datasets)
+    assert reports[0].ok
+    assert reports[1].errors == ("missing file",)
+
+
+def test_check_catalog_stray_parquet(two_datasets: Catalog) -> None:
+    stray = two_datasets.klines_path("perp", "4h", "SOLUSDT")
+    stray.parent.mkdir(parents=True)
+    small_klines(2).write_parquet(stray)
+    reports = check_catalog(two_datasets)
+    assert [r.dataset for r in reports] == [
+        "perp/klines/1d/BTCUSDT",
+        "perp/klines/4h/SOLUSDT",
+        "spot/klines/1d/ETHUSDT",
+    ]
+    assert reports[1].errors == ("not in manifest",)
+    assert reports[0].ok
+    assert reports[2].ok
+
+
+def test_check_catalog_validates_content(catalog: Catalog) -> None:
+    catalog.write_klines("perp", "1d", "BTCUSDT", small_klines(3), [], {}, NOW)
+    path = catalog.klines_path("perp", "1d", "BTCUSDT")
+    broken = small_klines(3).with_columns(pl.lit(-1.0).alias("open"))
+    broken.write_parquet(path)
+    (report,) = check_catalog(catalog)
+    assert any(e.startswith("non-positive open") for e in report.errors)
