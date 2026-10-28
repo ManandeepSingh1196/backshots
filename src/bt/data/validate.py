@@ -8,6 +8,7 @@ and never delete them.
 from __future__ import annotations
 
 from collections.abc import Mapping
+import re
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from types import MappingProxyType
@@ -15,13 +16,19 @@ from typing import Final, Literal
 
 import polars as pl
 
+from bt.core.errors import DataError
+
 Market = Literal["spot", "perp"]
 Timeframe = Literal["1d", "4h"]
+FlagReason = Literal["zero_volume", "jump", "wide_range", "extreme_rate"]
+
+SYMBOL_PATTERN: Final = r"^[A-Z0-9]{2,20}$"
 
 TIMEFRAME_DELTA: Final[Mapping[Timeframe, timedelta]] = MappingProxyType(
     {"1d": timedelta(days=1), "4h": timedelta(hours=4)}
 )
 _TS = pl.Datetime("us", "UTC")
+# Schemas map column name -> dtype instance (e.g. pl.Float64(), not the class).
 KLINE_SCHEMA: Final[Mapping[str, pl.DataType]] = MappingProxyType(
     {
         "ts": _TS,
@@ -60,7 +67,7 @@ class BarFlag:
     """A suspicious bar or funding event: kept in the data, only reported."""
 
     ts: datetime
-    reason: str
+    reason: FlagReason
 
 
 @dataclass(frozen=True, slots=True)
@@ -82,6 +89,13 @@ class ValidationReport:
     @property
     def ok(self) -> bool:
         return not self.errors
+
+
+def check_symbol(symbol: str) -> str:
+    """Return `symbol` unchanged if it matches SYMBOL_PATTERN, else raise DataError."""
+    if re.fullmatch(SYMBOL_PATTERN, symbol) is None:
+        raise DataError(f"invalid symbol {symbol!r}: must match {SYMBOL_PATTERN}")
+    return symbol
 
 
 def _schema_error(df: pl.DataFrame, expected: Mapping[str, pl.DataType]) -> str | None:
@@ -159,7 +173,7 @@ def _bounds(df: pl.DataFrame) -> tuple[datetime | None, datetime | None]:
     return df["ts"].min(), df["ts"].max()  # pyright: ignore[reportReturnType]
 
 
-def _flags(df: pl.DataFrame, cond: pl.Expr, reason: str) -> list[BarFlag]:
+def _flags(df: pl.DataFrame, cond: pl.Expr, reason: FlagReason) -> list[BarFlag]:
     hits = df.filter(cond.fill_null(False))
     return [BarFlag(ts=t, reason=reason) for t in hits["ts"].to_list()]
 
