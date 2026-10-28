@@ -14,7 +14,7 @@ import pytest
 
 from bt.core.errors import DataError, DataValidationError, TimezoneError
 from bt.data.catalog import Catalog, ManifestEntry
-from bt.data.validate import KLINE_SCHEMA
+from bt.data.validate import FUNDING_SCHEMA, KLINE_SCHEMA
 
 D0 = datetime(2024, 1, 1, tzinfo=UTC)
 T0 = datetime(2024, 3, 10, 12, tzinfo=UTC)
@@ -247,3 +247,37 @@ def test_read_klines_garbage_file(tmp_path: Path) -> None:
     path.write_bytes(b"not parquet")
     with pytest.raises(DataError):
         cat.read_klines("perp", "1d", "BTCUSDT")
+
+
+def funding_df() -> pl.DataFrame:
+    return pl.DataFrame(
+        {
+            "ts": [D0 + timedelta(hours=8 * i) for i in range(4)],
+            "rate": [0.0001, -0.0002, 0.0001, 0.00005],
+            "mark_price": [42000.5, None, 42100.0, None],
+        },
+        schema=dict(FUNDING_SCHEMA),
+    )
+
+
+def test_funding_round_trip_with_null_mark_price(tmp_path: Path) -> None:
+    cat = Catalog(tmp_path)
+    df = funding_df()
+    entry = cat.write_funding("BTCUSDT", df, ("ccxt:binance:fapiPublicGetFundingRate",), {}, T0)
+    assert entry.path == "binance/perp/funding/BTCUSDT.parquet"
+    assert entry.rows == 4
+    assert entry.last_ts == D0 + timedelta(hours=24)
+    back = cat.read_funding("BTCUSDT")
+    assert back.equals(df)
+    assert back["mark_price"].null_count() == 2
+    assert cat.manifest()[entry.path] == entry
+
+
+def test_funding_invalid_and_missing(tmp_path: Path) -> None:
+    cat = Catalog(tmp_path)
+    with pytest.raises(DataValidationError, match=r"perp/funding/BTCUSDT"):
+        cat.write_funding("BTCUSDT", funding_df().head(0), (), {}, T0)
+    with pytest.raises(DataError):
+        cat.read_funding("BTCUSDT")
+    with pytest.raises(DataError):
+        cat.write_funding("btc", funding_df(), (), {}, T0)

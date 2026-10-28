@@ -17,11 +17,13 @@ import polars as pl
 from bt.core.clock import ensure_utc
 from bt.core.errors import DataError, DataValidationError
 from bt.data.validate import (
+    FUNDING_SCHEMA,
     KLINE_SCHEMA,
     Market,
     Timeframe,
     ValidationReport,
     check_symbol,
+    validate_funding,
     validate_klines,
 )
 
@@ -218,6 +220,21 @@ class Catalog:
 
     def read_klines(self, market: Market, timeframe: Timeframe, symbol: str) -> pl.DataFrame:
         return _read_parquet(self.klines_path(market, timeframe, symbol), KLINE_SCHEMA)
+
+    def write_funding(
+        self,
+        symbol: str,
+        df: pl.DataFrame,
+        sources: Sequence[str],
+        checksums: Mapping[str, str],
+        ingested_at: datetime,
+    ) -> ManifestEntry:
+        path = self.funding_path(symbol)
+        report = validate_funding(df, f"perp/funding/{symbol}")
+        return self._store(path, df, report, sources, checksums, ingested_at)
+
+    def read_funding(self, symbol: str) -> pl.DataFrame:
+        return _read_parquet(self.funding_path(symbol), FUNDING_SCHEMA)
 
     def _manifest_path(self) -> Path:
         return self._root / "manifest.json"
