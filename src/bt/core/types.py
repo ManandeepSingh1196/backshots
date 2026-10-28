@@ -49,6 +49,14 @@ def _finite(owner: str, **values: float | None) -> None:
             raise InvariantError(f"{owner}.{name} must be finite, got {value!r}")
 
 
+def _coerce[E: StrEnum](enum_cls: type[E], value: object, owner: str, field: str, label: str) -> E:
+    """Return the exact (case-sensitive) enum member for value, or raise InvariantError."""
+    try:
+        return enum_cls(value)
+    except ValueError as exc:
+        raise InvariantError(f"{owner}.{field}: unknown {label} {value!r}") from exc
+
+
 def _require(cond: bool, message: str) -> None:
     if not cond:
         raise InvariantError(message)
@@ -79,6 +87,13 @@ class Instrument:
     maint_margin_rate: float = 0.0
 
     def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "kind",
+            _coerce(
+                InstrumentKind, self.kind, f"Instrument {self.symbol}", "kind", "instrument kind"
+            ),
+        )
         _finite(
             "Instrument",
             min_qty=self.min_qty,
@@ -179,6 +194,9 @@ class Order:
     tag: str = ""
 
     def __post_init__(self) -> None:
+        owner = f"Order {self.id}"
+        object.__setattr__(self, "side", _coerce(Side, self.side, owner, "side", "side"))
+        object.__setattr__(self, "type", _coerce(OrderType, self.type, owner, "type", "order type"))
         _finite("Order", qty=self.qty, limit_price=self.limit_price, stop_price=self.stop_price)
         _require(bool(self.id), "Order.id must be non-empty")
         _require(bool(self.symbol), "Order.symbol must be non-empty")
@@ -221,6 +239,9 @@ class Fill:
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "ts", ensure_utc(self.ts, "Fill.ts"))
+        object.__setattr__(
+            self, "side", _coerce(Side, self.side, f"Fill {self.order_id}", "side", "side")
+        )
         _finite(
             "Fill", qty=self.qty, price=self.price, fee=self.fee, slippage_cost=self.slippage_cost
         )
