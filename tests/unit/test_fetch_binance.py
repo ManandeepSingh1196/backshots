@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from datetime import UTC, date, datetime
 from pathlib import Path
 
@@ -410,7 +411,7 @@ def test_funding_with_and_without_header() -> None:
 
 
 def test_funding_header_locates_columns_by_name() -> None:
-    raw = "last_funding_rate,calc_time\n0.0002,1704096000000\n"
+    raw = "calc_time,last_funding_rate\n1704096000000,0.0002\n"
     df = parse_funding_csv(raw.encode())
     assert df["rate"].to_list() == [pytest.approx(0.0002, abs=1e-12)]
     assert df["ts"][0] == datetime(2024, 1, 1, 8, tzinfo=UTC)
@@ -433,5 +434,70 @@ def test_funding_bad_rows_raise() -> None:
         parse_funding_csv(f"{FUND_ROW}\n1704067200000,8\n".encode())
     with pytest.raises(ArchiveError, match="line 1"):
         parse_funding_csv(b"1704067200000,8,oops\n")
-    with pytest.raises(ArchiveError, match="header"):
+    with pytest.raises(ArchiveError, match="line 1"):
         parse_funding_csv(b"a,b,c\n1,2,3\n")
+
+
+def test_garbage_first_row_is_not_dropped_as_header() -> None:
+    with pytest.raises(ArchiveError, match="line 1"):
+        parse_klines_csv(ROW_MS.replace("1704067200000", "abc", 1).encode())
+    with pytest.raises(ArchiveError, match="line 1"):
+        parse_funding_csv(b"abc,8,0.0001\n")
+
+
+def test_float_formatted_ts_raises() -> None:
+    with pytest.raises(ArchiveError, match="line 1"):
+        parse_klines_csv(ROW_MS.replace("1704067200000", "1.7e12", 1).encode())
+
+
+@pytest.mark.parametrize("bad", ["nan", "NaN", "inf", "-inf", "Infinity", "-INF"])
+def test_non_finite_values_rejected(bad: str) -> None:
+    row = ROW_MS.replace("42283.58", bad, 1)
+    with pytest.raises(ArchiveError, match="line 2"):
+        parse_klines_csv(f"{ROW_MS}\n{row}\n".encode())
+    with pytest.raises(ArchiveError, match="line 1"):
+        parse_funding_csv(f"1704067200000,8,{bad}\n".encode())
+
+
+def test_atomic_write_failure_leaves_no_temp_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def boom(src: object, dst: object) -> None:
+        raise OSError("disk gone")
+
+    monkeypatch.setattr(os, "replace", boom)
+    z = build_csv_zip(CSV)
+    server = ArchiveServer({FILE.url: (200, z), FILE.checksum_url: (200, build_checksum(z, FNAME))})
+    with server.client() as c, pytest.raises(OSError, match="disk gone"):
+        download_archive(c, FILE, tmp_path)
+    assert [p for p in tmp_path.rglob("*") if p.is_file()] == []
+
+
+def test_cached_zip_with_bad_members_is_evicted_and_replaced(tmp_path: Path) -> None:
+    bad = build_zip({"a.csv": b"1\n", "b.csv": b"2\n"})
+    zip_path = tmp_path / REL
+    zip_path.parent.mkdir(parents=True)
+    zip_path.write_bytes(bad)
+    (tmp_path / (REL + ".CHECKSUM")).write_bytes(build_checksum(bad, FNAME))
+    server, z = _serve()
+    with server.client() as c:
+        data = download_archive(c, FILE, tmp_path)
+    assert server.request_count == 2
+    assert data is not None
+    assert data.csv == CSV
+    assert zip_path.read_bytes() == z
+
+
+def test_listing_december_to_january_rollover() -> None:
+    files = kline_archive_files(
+        "spot", "1d", "BTCUSDT", date(2023, 12, 15), date(2024, 1, 31), today=date(2024, 1, 10)
+    )
+    assert [f.period for f in files] == ["2023-12"] + [f"2024-01-{d:02d}" for d in range(1, 10)]
+
+
+def test_listing_today_on_first_of_month() -> None:
+    files = kline_archive_files(
+        "spot", "1d", "BTCUSDT", date(2024, 1, 20), date(2024, 3, 1), today=date(2024, 3, 1)
+    )
+    assert [f.period for f in files] == ["2024-01", "2024-02"]
+    assert not any("/daily/" in f.url for f in files)

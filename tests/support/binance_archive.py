@@ -45,6 +45,7 @@ def build_csv_zip(csv: bytes, name: str = "data.csv") -> bytes:
 
 
 def sha256_hex(data: bytes) -> str:
+    """Return the lowercase SHA-256 hex digest of `data`."""
     return hashlib.sha256(data).hexdigest()
 
 

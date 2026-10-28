@@ -9,8 +9,10 @@ import calendar
 import csv
 import hashlib
 import io
+import math
 import os
 import re
+import tempfile
 import zipfile
 from zlib import error as zlib_error
 from dataclasses import dataclass
@@ -194,9 +196,15 @@ def _extract_csv(zip_bytes: bytes, url: str) -> bytes:
 
 def _atomic_write(path: Path, data: bytes) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(path.name + ".tmp")
-    tmp.write_bytes(data)
-    os.replace(tmp, path)
+    fd, tmp_name = tempfile.mkstemp(dir=path.parent, prefix=path.name, suffix=".tmp")
+    tmp = Path(tmp_name)
+    try:
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(data)
+        os.replace(tmp, path)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
 
 
 def _cache_path(cache_dir: Path, url: str) -> Path:
@@ -222,7 +230,13 @@ def _from_cache(file: ArchiveFile, zip_path: Path, sum_path: Path) -> ArchiveDat
         zip_path.unlink()
         sum_path.unlink()
         return None
-    return ArchiveData(file=file, sha256=actual, csv=_extract_csv(zip_bytes, file.url))
+    try:
+        csv = _extract_csv(zip_bytes, file.url)
+    except ArchiveError:
+        zip_path.unlink()
+        sum_path.unlink()
+        return None
+    return ArchiveData(file=file, sha256=actual, csv=csv)
 
 
 def download_archive(client: httpx.Client, file: ArchiveFile, cache_dir: Path) -> ArchiveData | None:
@@ -268,14 +282,6 @@ def _rows(raw: bytes) -> list[tuple[int, list[str]]]:
     return [(reader.line_num, row) for row in reader if row]
 
 
-def _is_int(field: str) -> bool:
-    try:
-        int(field)
-    except ValueError:
-        return False
-    return True
-
-
 def _to_us(raw_ts: int) -> int:
     """Microseconds since epoch: `raw_ts` is already µs if >= MICROS_THRESHOLD, else ms."""
     return raw_ts if raw_ts >= MICROS_THRESHOLD else raw_ts * 1000
@@ -283,9 +289,12 @@ def _to_us(raw_ts: int) -> int:
 
 def _num(field: str, line: int, name: str) -> float:
     try:
-        return float(field)
+        value = float(field)
     except ValueError as exc:
         raise ArchiveError(f"line {line}: bad {name} {field!r}") from exc
+    if not math.isfinite(value):
+        raise ArchiveError(f"line {line}: non-finite {name} {field!r}")
+    return value
 
 
 def _integer(field: str, line: int, name: str) -> int:
@@ -305,7 +314,7 @@ def parse_klines_csv(raw: bytes) -> pl.DataFrame:
     Duplicate timestamps are kept; validation reports them.
     """
     rows = _rows(raw)
-    if rows and not _is_int(rows[0][1][0].strip()):
+    if rows and rows[0][1][0].strip() == "open_time":
         rows = rows[1:]
     ts: list[int] = []
     cols: dict[str, list[float]] = {k: [] for k in ("open", "high", "low", "close", "volume", "quote_volume")}
@@ -334,7 +343,7 @@ def parse_funding_csv(raw: bytes) -> pl.DataFrame:
     """
     rows = _rows(raw)
     t_idx, r_idx, width = 0, 2, len(_FUNDING_HEADER)
-    if rows and not _is_int(rows[0][1][0].strip()):
+    if rows and rows[0][1][0].strip() == "calc_time":
         header = [h.strip() for h in rows[0][1]]
         missing = [h for h in ("calc_time", "last_funding_rate") if h not in header]
         if missing:
