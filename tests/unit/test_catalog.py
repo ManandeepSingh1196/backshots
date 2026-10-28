@@ -388,3 +388,21 @@ def test_instruments_atomic(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> 
         cat.write_instruments(instruments()[:1], T0)
     assert (tmp_path / "instruments.json").read_bytes() == before
     assert [p.name for p in tmp_path.iterdir()] == ["instruments.json"]
+
+
+@pytest.mark.parametrize("bad", ["{", '{"version": 2, "files": {}}'])
+def test_bad_manifest_blocks_write_before_data_changes(tmp_path: Path, bad: str) -> None:
+    cat = Catalog(tmp_path)
+    put(cat)
+    path = cat.klines_path("perp", "1d", "BTCUSDT")
+    (tmp_path / "manifest.json").write_text(bad)
+    before = path.read_bytes()
+    with pytest.raises(DataError):
+        put(cat, klines_df(3))
+    assert path.read_bytes() == before
+    with pytest.raises(DataError):
+        cat.write_klines("spot", "1d", "ETHUSDT", klines_df(), (), {}, T0)
+    assert not cat.klines_path("spot", "1d", "ETHUSDT").exists()
+    with pytest.raises(DataError):
+        cat.write_funding("BTCUSDT", funding_df(), (), {}, T0)
+    assert not cat.funding_path("BTCUSDT").exists()

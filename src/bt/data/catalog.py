@@ -246,6 +246,11 @@ class Catalog:
         checksums: Mapping[str, str],
         ingested_at: datetime,
     ) -> ManifestEntry:
+        """Validate and store klines atomically, then update the manifest.
+
+        The Parquet footer embeds the polars version (`created_by`), so `sha256` is
+        stable within one install but may change across polars versions.
+        """
         path = self.klines_path(market, timeframe, symbol)
         dataset = f"{market}/klines/{timeframe}/{symbol}"
         report = validate_klines(df, timeframe, dataset)
@@ -314,10 +319,18 @@ class Catalog:
         checksums: Mapping[str, str],
         ingested_at: datetime,
     ) -> ManifestEntry:
+        """Validate, then replace the data file, then replace the manifest.
+
+        The two replaces are separate steps: if the manifest write fails (e.g. disk
+        full) after the data replace, file and manifest disagree until the next
+        successful write; the manifest's sha256 lets a later check detect that.
+        """
         ingested = ensure_utc(ingested_at, "ingested_at")
         if not report.ok:
             raise DataValidationError(f"{report.dataset} failed validation: " + "; ".join(report.errors))
         assert report.first_ts is not None and report.last_ts is not None
+        # Load the manifest first: a corrupt one must fail before the data file changes.
+        existing = self.manifest()
         digest: list[str] = []
 
         def write(tmp: Path) -> None:
@@ -335,7 +348,7 @@ class Catalog:
             ingested_at=ingested,
             sha256=digest[-1],
         )
-        files = {p: _entry_to_json(e) for p, e in self.manifest().items()}
+        files = {p: _entry_to_json(e) for p, e in existing.items()}
         files[entry.path] = _entry_to_json(entry)
         doc = {"version": _MANIFEST_VERSION, "files": files}
         _atomic_write_text(
