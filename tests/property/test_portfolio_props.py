@@ -3,7 +3,7 @@
 from datetime import UTC, datetime, timedelta
 
 import pytest
-from hypothesis import HealthCheck, given, settings
+from hypothesis import HealthCheck, event, given, settings
 from hypothesis import strategies as st
 
 from bt.core.errors import PortfolioError
@@ -78,6 +78,8 @@ def test_accounting_invariants(
     expected_cash = START
     notional_sum = 0.0
     n = 0
+    # Early mark: exercises the fill/mark ordering guard (later fills must not predate it).
+    p.mark(ts, {SYMS[0]: 1.0})
     for kind, sym, nsteps, price, feef, frac, days, price2 in ops:
         step = STEPS[sym]
         n += 1
@@ -134,6 +136,31 @@ def test_accounting_invariants(
         assert p.cash == pytest.approx(expected_cash, abs=_tol(notional_sum, 1e-7))  # P4
         for s_ in SYMS:
             assert p.position(s_).qty == pytest.approx(held[s_] * STEPS[s_], abs=1e-9)
+    event("flat before close-out" if not p.positions() else "open before close-out")
+    for sym in SYMS:  # final close-out of everything still held
+        if held[sym]:
+            qty = held[sym] * STEPS[sym]
+            p.apply_fill(Fill(f"c{sym}", sym, ts, Side.SELL, qty, 10.0, 0.0, 0.0, False))
+            held[sym] = 0
+    _check_invariants(p)
+    assert len(p.positions()) == 0
+
+
+@settings(derandomize=True, max_examples=2000, deadline=None)
+@given(
+    st.lists(st.integers(1, 5_000_000), min_size=10, max_size=10),
+    st.floats(0.5, 1e5),
+)
+def test_sell_of_summed_grid_buys_closes_exactly(nsteps: list[int], price: float) -> None:
+    p = Portfolio(1e18, [_inst("AAAUSDT")])
+    total = 0.0
+    for i, n in enumerate(nsteps):
+        qty = n * 0.001
+        p.apply_fill(Fill(f"b{i}", "AAAUSDT", T0, Side.BUY, qty, price, 0.0, 0.0, False))
+        total += qty
+    p.apply_fill(Fill("s", "AAAUSDT", T0, Side.SELL, total, price, 0.0, 0.0, False))
+    assert p.position("AAAUSDT").qty == 0.0
+    assert len(p.positions()) == 0
 
 
 @SETTINGS
