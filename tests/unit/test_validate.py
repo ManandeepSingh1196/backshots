@@ -6,7 +6,9 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import polars as pl
+import pytest
 
+from bt.core.errors import DataError
 from bt.data.validate import (
     FUNDING_INTERVAL,
     FUNDING_SCHEMA,
@@ -14,6 +16,7 @@ from bt.data.validate import (
     TIMEFRAME_DELTA,
     BarFlag,
     Gap,
+    check_symbol,
     validate_funding,
     validate_klines,
 )
@@ -282,3 +285,15 @@ def test_funding_gap_missing_at_least_one() -> None:
     )
     day = validate_funding(fund_ts([0.0, 24.0]), "x")
     assert day.gaps == (Gap(after_ts=H(0), before_ts=H(24), missing=2),)
+
+
+def test_check_symbol_valid() -> None:
+    assert check_symbol("BTCUSDT") == "BTCUSDT"
+    assert check_symbol("1000SHIBUSDT") == "1000SHIBUSDT"
+
+
+@pytest.mark.parametrize("bad", ["btcusdt", "../x", "B", "", "A" * 21, "BTC\n", "BTC USDT"])
+def test_check_symbol_rejects(bad: str) -> None:
+    with pytest.raises(DataError) as exc:
+        check_symbol(bad)
+    assert repr(bad) in str(exc.value) or bad in str(exc.value)
