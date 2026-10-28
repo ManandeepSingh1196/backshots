@@ -27,3 +27,23 @@ class ChecksumMismatchError(DataError):
 
 class ArchiveError(DataError):
     """Malformed archive, inconsistent listing, or HTTP failure after retries."""
+
+
+class LookAheadError(BtError):
+    """A read reached data at or after a step not yet delivered."""
+
+
+class StrategyError(BtError):
+    """Registry misuse, bad params, or a strategy that raised or returned an invalid intent."""
+
+
+class ExecutionError(BtError):
+    """Bad arguments to fees, slippage, rules or broker, or broker misuse."""
+
+
+class PortfolioError(BtError):
+    """A fill or mark that would break portfolio invariants; state is left unchanged."""
+
+
+class EngineError(BtError):
+    """Inconsistent wiring: instrument sets differ, feed reused, or unsupported kind."""
