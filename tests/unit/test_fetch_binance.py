@@ -1,14 +1,22 @@
 from __future__ import annotations
 
 from datetime import date
+from pathlib import Path
 
 import pytest
 
-from bt.core.errors import DataError
+from bt.core.errors import ArchiveError, ChecksumMismatchError, DataError
 from bt.data.fetch_binance import (
     daily_kline_archive_files,
+    download_archive,
     funding_archive_files,
     kline_archive_files,
+)
+from tests.support.binance_archive import (
+    ArchiveServer,
+    build_checksum,
+    build_csv_zip,
+    sha256_hex,
 )
 
 BASE = "https://data.binance.vision"
@@ -92,3 +100,93 @@ def test_invalid_symbol_raises_data_error() -> None:
         daily_kline_archive_files("perp", "1d", "../x", date(2024, 1, 1))
     with pytest.raises(DataError):
         funding_archive_files("B", date(2024, 1, 1), TODAY, today=TODAY)
+
+
+# --- download ---------------------------------------------------------------------------
+
+CSV = b"1,2,3\n"
+FILE = kline_archive_files(
+    "spot", "1d", "BTCUSDT", date(2024, 1, 1), date(2024, 1, 31), today=TODAY
+)[0]
+FNAME = "BTCUSDT-1d-2024-01.zip"
+REL = "data/spot/monthly/klines/BTCUSDT/1d/BTCUSDT-1d-2024-01.zip"
+
+
+def _serve(zip_bytes: bytes | None = None) -> tuple[ArchiveServer, bytes]:
+    z = zip_bytes if zip_bytes is not None else build_csv_zip(CSV, "BTCUSDT-1d-2024-01.csv")
+    server = ArchiveServer({FILE.url: (200, z), FILE.checksum_url: (200, build_checksum(z, FNAME))})
+    return server, z
+
+
+def test_download_happy_path_and_cache_layout(tmp_path: Path) -> None:
+    server, z = _serve()
+    with server.client() as c:
+        data = download_archive(c, FILE, tmp_path)
+    assert data is not None
+    assert data.csv == CSV
+    assert data.sha256 == sha256_hex(z)
+    assert data.file == FILE
+    assert (tmp_path / REL).read_bytes() == z
+    assert (tmp_path / (REL + ".CHECKSUM")).exists()
+    assert server.requested_urls == [FILE.checksum_url, FILE.url]
+
+
+def test_second_call_served_from_cache(tmp_path: Path) -> None:
+    server, _ = _serve()
+    with server.client() as c:
+        first = download_archive(c, FILE, tmp_path)
+    with ArchiveServer.failing().client() as c:
+        second = download_archive(c, FILE, tmp_path)
+    assert first == second
+
+
+def test_corrupted_cache_is_redownloaded(tmp_path: Path) -> None:
+    server, z = _serve()
+    with server.client() as c:
+        download_archive(c, FILE, tmp_path)
+    (tmp_path / REL).write_bytes(z + b"x")
+    server2, _ = _serve(z)
+    with server2.client() as c:
+        data = download_archive(c, FILE, tmp_path)
+    assert server2.request_count == 2
+    assert data is not None
+    assert data.csv == CSV
+    assert (tmp_path / REL).read_bytes() == z
+
+
+def test_half_cached_entry_is_redownloaded(tmp_path: Path) -> None:
+    server, z = _serve()
+    with server.client() as c:
+        download_archive(c, FILE, tmp_path)
+    (tmp_path / (REL + ".CHECKSUM")).unlink()
+    server2, _ = _serve(z)
+    with server2.client() as c:
+        assert download_archive(c, FILE, tmp_path) is not None
+    assert server2.request_count == 2
+
+
+def test_checksum_mismatch_caches_nothing(tmp_path: Path) -> None:
+    z = build_csv_zip(CSV)
+    server = ArchiveServer(
+        {FILE.url: (200, z), FILE.checksum_url: (200, build_checksum(z + b"?", FNAME))}
+    )
+    with server.client() as c, pytest.raises(ChecksumMismatchError) as exc:
+        download_archive(c, FILE, tmp_path)
+    assert FILE.url in str(exc.value)
+    assert sha256_hex(z) in str(exc.value)
+    assert sha256_hex(z + b"?") in str(exc.value)
+    assert [p for p in tmp_path.rglob("*") if p.is_file()] == []
+
+
+def test_checksum_404_returns_none(tmp_path: Path) -> None:
+    server = ArchiveServer({})
+    with server.client() as c:
+        assert download_archive(c, FILE, tmp_path) is None
+    assert server.request_count == 1
+
+
+def test_zip_404_with_checksum_raises(tmp_path: Path) -> None:
+    z = build_csv_zip(CSV)
+    server = ArchiveServer({FILE.checksum_url: (200, build_checksum(z, FNAME))})
+    with server.client() as c, pytest.raises(ArchiveError, match="404"):
+        download_archive(c, FILE, tmp_path)
