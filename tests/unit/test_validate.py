@@ -236,3 +236,12 @@ def test_inputs_not_mutated() -> None:
     validate_funding(f, "x")
     assert k.equals(k0)
     assert f.equals(f0)
+
+
+def test_funding_gap_missing_at_least_one() -> None:
+    near = funding([{"ts": H(0)}, {"ts": H(8) + timedelta(minutes=2)}])
+    assert validate_funding(near, "x").gaps == (
+        Gap(after_ts=H(0), before_ts=H(8) + timedelta(minutes=2), missing=1),
+    )
+    day = validate_funding(fund_ts([0.0, 24.0]), "x")
+    assert day.gaps == (Gap(after_ts=H(0), before_ts=H(24), missing=2),)
