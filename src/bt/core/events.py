@@ -1,11 +1,15 @@
 """Run event records and the append-only EventLog."""
 
+import math
 from dataclasses import dataclass
 from datetime import datetime
 from itertools import pairwise
-from typing import Final, Literal, get_args
+from typing import Final, Literal, cast, get_args
 
 from bt.core.clock import ensure_utc
+from bt.core.errors import InvariantError
+
+# Same-package helpers deliberately shared with types.py.
 from bt.core.types import (
     Fill,
     Order,
@@ -150,11 +154,17 @@ class LogRecord:
 
     ts: datetime
     message: str
-    fields: tuple[tuple[str, LogValue], ...] = ()
+    fields: tuple[tuple[str, LogValue], ...]
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "ts", ensure_utc(self.ts, "LogRecord.ts"))
         _require(bool(self.message), "LogRecord.message must be non-empty")
+        raw: object = self.fields
+        if not isinstance(raw, tuple):  # pyright: ignore[reportUnnecessaryIsInstance]
+            raise InvariantError("LogRecord.fields must be a tuple of (key, value) pairs")
+        for entry in cast("tuple[object, ...]", raw):
+            if not isinstance(entry, tuple) or len(cast("tuple[object, ...]", entry)) != 2:
+                raise InvariantError(f"LogRecord: field entry {entry!r} must be a 2-tuple")
         pairs = tuple((k, v) for k, v in self.fields)
         object.__setattr__(self, "fields", pairs)
         for key, value in pairs:
@@ -162,6 +172,10 @@ class LogRecord:
             _require(
                 value is None or isinstance(value, str | int | float | bool),  # pyright: ignore[reportUnnecessaryIsInstance]
                 f"LogRecord: field {key!r} has unsupported value type {type(value).__name__}",
+            )
+            _require(
+                not isinstance(value, float) or math.isfinite(value),
+                f"LogRecord: field {key!r} must be finite, got {value!r}",
             )
         keys = [k for k, _ in pairs]
         _require(

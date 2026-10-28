@@ -69,14 +69,14 @@ def test_naive_ts_raises() -> None:
     with pytest.raises(TimezoneError):
         _skip(ts=naive)
     with pytest.raises(TimezoneError):
-        LogRecord(naive, "m")
+        LogRecord(naive, "m", ())
 
 
 def test_ts_normalised_to_utc() -> None:
     assert OrderRecord(LONDON, ORDER, OrderStatus.NEW).ts.tzinfo is UTC
     assert _snap(ts=LONDON).ts.tzinfo is UTC
     assert _skip(ts=LONDON).ts.tzinfo is UTC
-    assert LogRecord(LONDON, "m").ts.tzinfo is UTC
+    assert LogRecord(LONDON, "m", ()).ts.tzinfo is UTC
 
 
 def test_skipped_order() -> None:
@@ -114,7 +114,7 @@ def test_equity_snapshot() -> None:
 def test_log_record() -> None:
     r = LogRecord(T, "signal", (("a", 1), ("b", "x")))
     assert hash(r) == hash(LogRecord(T, "signal", (("a", 1), ("b", "x"))))
-    assert LogRecord(T, "m").fields == ()
+    assert LogRecord(T, "m", ()).fields == ()
     bad: list[Any] = [
         (T, "signal", (("a", [1]),)),
         (T, "signal", (("a", object()),)),
@@ -122,6 +122,13 @@ def test_log_record() -> None:
         (T, "signal", (("a", 1), ("a", 2))),
         (T, "signal", ((1, 1),)),
         (T, "", ()),
+        (T, "signal", (("a", float("nan")),)),
+        (T, "signal", (("a", float("inf")),)),
+        (T, "signal", (("a", float("-inf")),)),
+        (T, "signal", {"ab": 1}),
+        (T, "signal", "ab"),
+        (T, "signal", (("a",),)),
+        (T, "signal", (("a", 1, 2),)),
     ]
     for args in bad:
         with pytest.raises(InvariantError):
@@ -135,7 +142,7 @@ def test_event_log_order_and_snapshots() -> None:
     fill = Fill("o1", "BTCUSDT", T, Side.BUY, 1.0, 100.0, 0.1, 0.0, False)
     sk = _skip()
     e1, e2 = _snap(), _snap(equity=1001.0)
-    msg = LogRecord(T, "hi")
+    msg = LogRecord(T, "hi", ())
     log.record_order(o1)
     log.record_order(o2)
     log.record_fill(fill)
@@ -156,7 +163,7 @@ def test_event_log_order_and_snapshots() -> None:
 
 def test_event_logs_do_not_share_state() -> None:
     a, b = EventLog(), EventLog()
-    a.record_message(LogRecord(T, "x"))
+    a.record_message(LogRecord(T, "x", ()))
     assert b.messages() == ()
 
 
