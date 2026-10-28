@@ -5,6 +5,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from enum import StrEnum
+from types import MappingProxyType
 
 from bt.core.clock import ensure_utc
 from bt.core.errors import InvariantError
@@ -127,7 +128,7 @@ class Bar:
     quote_volume: float
 
     def __post_init__(self) -> None:
-        ensure_utc(self.ts, "Bar.ts")
+        object.__setattr__(self, "ts", ensure_utc(self.ts, "Bar.ts"))
         _finite(
             "Bar",
             open=self.open,
@@ -154,7 +155,7 @@ class FundingEvent:
     rate: float
 
     def __post_init__(self) -> None:
-        ensure_utc(self.ts, "FundingEvent.ts")
+        object.__setattr__(self, "ts", ensure_utc(self.ts, "FundingEvent.ts"))
         _finite("FundingEvent", rate=self.rate)
 
 
@@ -192,11 +193,13 @@ class Order:
                 self.limit_price is not None and self.limit_price > 0 and self.stop_price is None,
                 f"Order {self.id}: limit order needs limit_price > 0 and no stop_price",
             )
-        else:
+        elif self.type == OrderType.STOP:
             _require(
                 self.stop_price is not None and self.stop_price > 0 and self.limit_price is None,
                 f"Order {self.id}: stop order needs stop_price > 0 and no limit_price",
             )
+        else:
+            raise InvariantError(f"Order {self.id}: unknown order type {self.type!r}")
 
 
 @dataclass(frozen=True, slots=True)
@@ -217,7 +220,7 @@ class Fill:
     is_maker: bool
 
     def __post_init__(self) -> None:
-        ensure_utc(self.ts, "Fill.ts")
+        object.__setattr__(self, "ts", ensure_utc(self.ts, "Fill.ts"))
         _finite(
             "Fill", qty=self.qty, price=self.price, fee=self.fee, slippage_cost=self.slippage_cost
         )
@@ -264,6 +267,9 @@ class PositionView:
 class Step:
     """Everything the feed delivers for one timestamp.
 
+    Inputs are snapshotted (bars becomes a read-only mapping, funding a tuple) so later
+    mutation of the caller's containers cannot change the step.
+
     Invariants: ts is UTC; every bars key equals its bar's symbol and every bar
     is stamped exactly ts; every funding event has ts <= Step.ts. A step can
     therefore never carry a later bar (no look-ahead).
@@ -274,7 +280,9 @@ class Step:
     funding: Sequence[FundingEvent]
 
     def __post_init__(self) -> None:
-        ensure_utc(self.ts, "Step.ts")
+        object.__setattr__(self, "ts", ensure_utc(self.ts, "Step.ts"))
+        object.__setattr__(self, "bars", MappingProxyType(dict(self.bars)))
+        object.__setattr__(self, "funding", tuple(self.funding))
         for key, bar in self.bars.items():
             _require(
                 key == bar.symbol,

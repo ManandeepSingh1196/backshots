@@ -1,6 +1,7 @@
 import dataclasses
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
+from zoneinfo import ZoneInfo
 
 import pytest
 
@@ -424,3 +425,35 @@ def test_no_any_in_core() -> None:
             assert not (isinstance(node, ast.Attribute) and node.attr == "Any"), path
             if isinstance(node, ast.ImportFrom):
                 assert all(a.name != "Any" for a in node.names), path
+
+
+def test_timestamps_normalised_to_utc_on_all_types() -> None:
+    london = datetime(2024, 1, 1, tzinfo=ZoneInfo("Europe/London"))
+    assert make_bar(ts=london).ts.tzinfo is UTC
+    assert FundingEvent("BTCUSDT", london, 0.0).ts.tzinfo is UTC
+    assert make_fill(ts=london).ts.tzinfo is UTC
+    assert Step(london, {}, []).ts.tzinfo is UTC
+    assert make_bar(ts=datetime(2024, 1, 1, tzinfo=ZoneInfo("UTC"))).ts.tzinfo is UTC
+
+
+def test_london_summer_rejected_by_types() -> None:
+    summer = datetime(2024, 7, 1, tzinfo=ZoneInfo("Europe/London"))
+    with pytest.raises(TimezoneError):
+        make_bar(ts=summer)
+
+
+def test_step_snapshots_inputs() -> None:
+    d = {"BTCUSDT": make_bar()}
+    f: list[FundingEvent] = []
+    step = Step(T, d, f)
+    d["ETHUSDT"] = make_bar(symbol="ETHUSDT", ts=T + timedelta(days=1))
+    f.append(FundingEvent("BTCUSDT", T + timedelta(milliseconds=1), 0.0001))
+    assert set(step.bars) == {"BTCUSDT"}
+    assert len(step.funding) == 0
+    with pytest.raises(TypeError):
+        step.bars["X"] = make_bar()  # type: ignore[index]
+
+
+def test_order_unknown_type_rejected() -> None:
+    with pytest.raises(InvariantError, match="unknown order type"):
+        make_order(type="bogus")
