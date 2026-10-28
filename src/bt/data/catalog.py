@@ -7,7 +7,7 @@ import json
 import os
 import tempfile
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 from datetime import datetime
 from pathlib import Path
 from typing import Final, cast, get_args
@@ -15,7 +15,8 @@ from typing import Final, cast, get_args
 import polars as pl
 
 from bt.core.clock import ensure_utc
-from bt.core.errors import DataError, DataValidationError
+from bt.core.errors import DataError, DataValidationError, InvariantError
+from bt.core.types import Instrument, InstrumentKind
 from bt.data.validate import (
     FUNDING_SCHEMA,
     KLINE_SCHEMA,
@@ -28,6 +29,7 @@ from bt.data.validate import (
 )
 
 _MANIFEST_VERSION: Final = 1
+_INSTRUMENTS_VERSION: Final = 1
 _FILE_MODE: Final = 0o644
 
 
@@ -142,6 +144,37 @@ def _entry_from_json(raw: object) -> ManifestEntry:
     )
 
 
+def _instrument_to_json(inst: Instrument) -> dict[str, object]:
+    out: dict[str, object] = {f.name: getattr(inst, f.name) for f in fields(Instrument)}
+    out["kind"] = inst.kind.value
+    return out
+
+
+def _num(value: object, name: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, int | float):
+        raise TypeError(f"{name} must be a number, got {value!r}")
+    return float(value)
+
+
+def _instrument_from_json(raw: object) -> Instrument:
+    d = _obj(raw, "instrument")
+    return Instrument(
+        symbol=_str(d["symbol"], "symbol"),
+        venue_symbol=_str(d["venue_symbol"], "venue_symbol"),
+        kind=InstrumentKind(_str(d["kind"], "kind")),
+        base=_str(d["base"], "base"),
+        quote=_str(d["quote"], "quote"),
+        min_qty=_num(d["min_qty"], "min_qty"),
+        qty_step=_num(d["qty_step"], "qty_step"),
+        min_notional=_num(d["min_notional"], "min_notional"),
+        price_tick=_num(d["price_tick"], "price_tick"),
+        maker_fee=_num(d["maker_fee"], "maker_fee"),
+        taker_fee=_num(d["taker_fee"], "taker_fee"),
+        max_leverage=_num(d["max_leverage"], "max_leverage"),
+        maint_margin_rate=_num(d["maint_margin_rate"], "maint_margin_rate"),
+    )
+
+
 def _schema_matches(df: pl.DataFrame, expected: Mapping[str, pl.DataType]) -> bool:
     return list(df.schema.items()) == list(expected.items())
 
@@ -235,6 +268,39 @@ class Catalog:
 
     def read_funding(self, symbol: str) -> pl.DataFrame:
         return _read_parquet(self.funding_path(symbol), FUNDING_SCHEMA)
+
+    def write_instruments(self, instruments: Sequence[Instrument], fetched_at: datetime) -> None:
+        fetched = ensure_utc(fetched_at, "fetched_at")
+        doc = {
+            "version": _INSTRUMENTS_VERSION,
+            "fetched_at": fetched.isoformat(),
+            "instruments": [
+                _instrument_to_json(i) for i in sorted(instruments, key=lambda i: i.symbol)
+            ],
+        }
+        _atomic_write_text(
+            self._instruments_path(), json.dumps(doc, indent=2, sort_keys=True) + "\n"
+        )
+
+    def read_instruments(self) -> tuple[list[Instrument], datetime]:
+        path = self._instruments_path()
+        if not path.is_file():
+            raise DataError(f"instruments snapshot not found: {path}")
+        try:
+            top = _obj(json.loads(path.read_text(encoding="utf-8")), "instruments file")
+            version = top["version"]
+            if isinstance(version, bool) or version != _INSTRUMENTS_VERSION:
+                raise _UnknownVersionError(f"unsupported instruments version {version!r}")
+            fetched = _dt(top["fetched_at"], "fetched_at")
+            items = [_instrument_from_json(x) for x in _list(top["instruments"], "instruments")]
+        except _UnknownVersionError as e:
+            raise DataError(f"{path}: {e}") from e
+        except (KeyError, TypeError, ValueError, OSError, InvariantError) as e:
+            raise DataError(f"cannot parse instruments file {path}: {e!r}") from e
+        return items, fetched
+
+    def _instruments_path(self) -> Path:
+        return self._root / "instruments.json"
 
     def _manifest_path(self) -> Path:
         return self._root / "manifest.json"

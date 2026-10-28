@@ -12,7 +12,8 @@ from zoneinfo import ZoneInfo
 import polars as pl
 import pytest
 
-from bt.core.errors import DataError, DataValidationError, TimezoneError
+from bt.core.errors import DataError, DataValidationError, InvariantError, TimezoneError
+from bt.core.types import Instrument, InstrumentKind
 from bt.data.catalog import Catalog, ManifestEntry
 from bt.data.validate import FUNDING_SCHEMA, KLINE_SCHEMA
 
@@ -281,3 +282,109 @@ def test_funding_invalid_and_missing(tmp_path: Path) -> None:
         cat.read_funding("BTCUSDT")
     with pytest.raises(DataError):
         cat.write_funding("btc", funding_df(), (), {}, T0)
+
+
+def instruments() -> list[Instrument]:
+    perp = Instrument(
+        symbol="ETHUSDT-PERP",
+        venue_symbol="ETHUSDT",
+        kind=InstrumentKind.PERP,
+        base="ETH",
+        quote="USDT",
+        min_qty=0.001,
+        qty_step=0.001,
+        min_notional=5.0,
+        price_tick=0.01,
+        maker_fee=0.0002,
+        taker_fee=0.0005,
+        max_leverage=20.0,
+        maint_margin_rate=0.005,
+    )
+    spot = Instrument(
+        symbol="BTCUSDT",
+        venue_symbol="BTCUSDT",
+        kind=InstrumentKind.SPOT,
+        base="BTC",
+        quote="USDT",
+        min_qty=0.00001,
+        qty_step=0.00001,
+        min_notional=5.0,
+        price_tick=0.01,
+        maker_fee=0.001,
+        taker_fee=0.001,
+    )
+    return [perp, spot]
+
+
+def test_instruments_round_trip(tmp_path: Path) -> None:
+    cat = Catalog(tmp_path)
+    perp, spot = instruments()
+    cat.write_instruments([perp, spot], T0)
+    doc = json.loads((tmp_path / "instruments.json").read_text())
+    assert [i["symbol"] for i in doc["instruments"]] == ["BTCUSDT", "ETHUSDT-PERP"]
+    assert doc["instruments"][1]["kind"] == "perp"
+    assert doc["fetched_at"] == "2024-03-10T12:00:00+00:00"
+    got, fetched = cat.read_instruments()
+    assert got == [spot, perp]
+    assert fetched == T0
+
+
+def test_instruments_naive_fetched_at(tmp_path: Path) -> None:
+    with pytest.raises(TimezoneError):
+        Catalog(tmp_path).write_instruments(instruments(), datetime(2024, 3, 10, 12))  # noqa: DTZ001
+    assert not (tmp_path / "instruments.json").exists()
+
+
+def test_instruments_missing(tmp_path: Path) -> None:
+    with pytest.raises(DataError, match=r"instruments"):
+        Catalog(tmp_path).read_instruments()
+
+
+def test_instruments_invariant_violation_is_data_error(tmp_path: Path) -> None:
+    cat = Catalog(tmp_path)
+    cat.write_instruments(instruments(), T0)
+    path = tmp_path / "instruments.json"
+    doc = json.loads(path.read_text())
+    doc["instruments"][0]["qty_step"] = 0
+    path.write_text(json.dumps(doc))
+    with pytest.raises(DataError, match=r"instruments\.json") as ei:
+        cat.read_instruments()
+    assert isinstance(ei.value.__cause__, InvariantError)
+
+
+@pytest.mark.parametrize("text", ["{", "[]", '{"version": 1}', '{"version": 9, "instruments": []}'])
+def test_instruments_corrupt(tmp_path: Path, text: str) -> None:
+    (tmp_path / "instruments.json").write_text(text)
+    with pytest.raises(DataError, match=r"instruments\.json"):
+        Catalog(tmp_path).read_instruments()
+
+
+def test_instruments_bad_field_types(tmp_path: Path) -> None:
+    cat = Catalog(tmp_path)
+    cat.write_instruments(instruments(), T0)
+    path = tmp_path / "instruments.json"
+    doc = json.loads(path.read_text())
+    doc["instruments"][0]["kind"] = "future"
+    path.write_text(json.dumps(doc))
+    with pytest.raises(DataError):
+        cat.read_instruments()
+    doc["instruments"][0]["kind"] = "spot"
+    doc["instruments"][0]["min_qty"] = "1"
+    path.write_text(json.dumps(doc))
+    with pytest.raises(DataError):
+        cat.read_instruments()
+
+
+def test_instruments_atomic(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    cat = Catalog(tmp_path)
+    cat.write_instruments(instruments(), T0)
+    before = (tmp_path / "instruments.json").read_bytes()
+
+    def boom(self: Path, *args: object, **kwargs: object) -> int:
+        raise OSError("disk full")
+
+    monkeypatch.setattr(Path, "write_text", boom)
+    with pytest.raises(OSError, match="disk full"):
+        cat.write_instruments(instruments()[:1], T0)
+    assert (tmp_path / "instruments.json").read_bytes() == before
+    assert [p.name for p in tmp_path.iterdir()] == ["instruments.json"]
