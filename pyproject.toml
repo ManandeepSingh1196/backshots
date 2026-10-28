@@ -58,7 +58,7 @@ venv = ".venv"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-norecursedirs = [".worktrees", ".venv", "data", "runs", ".git"]
+norecursedirs = [".worktrees", ".venv", "data", "runs", ".git", ".hypothesis"]
 addopts = "--strict-markers"
 xfail_strict = true
 pythonpath = ["."]

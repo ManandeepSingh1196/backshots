@@ -8,3 +8,4 @@ __pycache__/
 *.sqlite
 .pytest_cache/
 .ruff_cache/
+.hypothesis/
