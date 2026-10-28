@@ -18,6 +18,7 @@ import httpx
 import polars as pl
 
 from bt.core.clock import ensure_utc
+from bt.core.types import Instrument
 from bt.data.catalog import Catalog, ManifestEntry
 from bt.data.fetch_binance import (
     ArchiveData,
@@ -29,7 +30,6 @@ from bt.data.fetch_binance import (
     parse_funding_csv,
     parse_klines_csv,
 )
-from bt.core.types import Instrument
 from bt.data.fetch_ccxt import (
     CcxtExchange,
     fetch_instruments,
@@ -71,8 +71,7 @@ _DAY: Final = timedelta(days=1)
 class IngestResult:
     """Outcome of ingesting one dataset.
 
-    Invariants: `entry` is None iff nothing was stored (then `report` is not ok, or the
-    dataset was empty); `missing_archives` holds only 404s that were not publication lag.
+    Invariants: `entry` is None iff nothing was stored (then `report` is not ok); `missing_archives` holds only 404s that were not publication lag.
     """
 
     dataset: str
@@ -123,13 +122,13 @@ def _collect(
             data = download_archive(client, f, cache_dir)
             if data is not None:
                 used.append(data)
-            elif not used:
-                continue
-            elif allow_fallback and fallback is not None and len(f.period) == 7:
+            elif used and allow_fallback and fallback is not None and len(f.period) == 7:
                 if fetch(fallback(f), False):
                     return True
             elif _last_day(f) >= lag_cut:
                 return True
+            elif not used:
+                continue
             else:
                 missing.append(f.url)
         return False
@@ -270,6 +269,7 @@ def ingest_instruments(
 ) -> list[Instrument]:
     """Fetch instrument rules for `symbols` on each market and store one snapshot at `now`."""
     now = ensure_utc(now, "now")
+    symbols = list(dict.fromkeys(symbols))
     for symbol in symbols:
         check_symbol(symbol)
     found: list[Instrument] = []

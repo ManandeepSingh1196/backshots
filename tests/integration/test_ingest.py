@@ -534,3 +534,69 @@ def test_check_catalog_validates_content(catalog: Catalog) -> None:
     broken.write_parquet(path)
     (report,) = check_catalog(catalog)
     assert any(e.startswith("non-positive open") for e in report.errors)
+
+
+# --------------------------------------------------------------------------- review round 1
+
+
+def test_lag_404_before_first_success_stops_archive_use(catalog: Catalog) -> None:
+    # today = 03-10, lag cut = 03-08. Daily 03-08 404s (lag) before any success, so the
+    # published 03-09 archive must not be used; ccxt fills 03-08 and 03-09 (03-10 is open).
+    responses: dict[str, Response] = {}
+    files = monthly(date(2024, 3, 8), NOW.date(), NOW.date())
+    publish(responses, files["2024-03-09"], kline_csv([date(2024, 3, 9)], close_adjust=7.0))
+    fake = exchange_with(days(date(2024, 3, 8), date(2024, 3, 10)))
+    result, _ = run(catalog, responses, fake, start=date(2024, 3, 8))
+    assert result.entry is not None
+    assert result.entry.rows == 2
+    assert result.entry.first_ts == at(date(2024, 3, 8))
+    assert result.report.gaps == ()
+    assert result.missing_archives == ()
+    assert result.entry.checksums == {}
+    df = catalog.read_klines("perp", "1d", "BTCUSDT")
+    assert df["close"][1] == pytest.approx(price(date(2024, 3, 9)), abs=1e-9)
+
+
+def test_start_mid_month_filters_archive_rows(catalog: Catalog) -> None:
+    # Jan 15..31 = 17, Feb = 29, Mar 1..8 = 8, Mar 9 from ccxt = 1 -> 55.
+    fake = exchange_with(days(date(2024, 3, 9), date(2024, 3, 10)))
+    result, _ = run(catalog, standard_responses(), fake, start=date(2024, 1, 15))
+    assert result.entry is not None
+    assert result.entry.rows == 55
+    assert result.entry.first_ts == at(date(2024, 1, 15))
+
+
+def test_end_inside_february_filters_monthly_archive(catalog: Catalog) -> None:
+    # Jan 31 + Feb 1..10 = 41; tail would start 03-01 >= tail_now 02-11, so no ccxt call.
+    fake = exchange_with(days(date(2024, 3, 9), date(2024, 3, 10)))
+    result, _ = run(catalog, standard_responses(), fake, end=date(2024, 2, 10))
+    assert result.entry is not None
+    assert result.entry.rows == 41
+    assert result.entry.last_ts == at(date(2024, 2, 10))
+    assert fake.calls_to("fapiPublicGetKlines") == []
+
+
+def test_end_inside_current_month(catalog: Catalog) -> None:
+    # Jan 31 + Feb 29 + Mar 1..5 = 65; tail would start 03-06 >= tail_now 03-06.
+    fake = exchange_with(days(date(2024, 3, 9), date(2024, 3, 10)))
+    result, _ = run(catalog, standard_responses(), fake, end=date(2024, 3, 5))
+    assert result.entry is not None
+    assert result.entry.rows == 65
+    assert result.entry.last_ts == at(date(2024, 3, 5))
+    assert fake.calls_to("fapiPublicGetKlines") == []
+
+
+def test_end_after_now_drops_unclosed_and_future_bars(catalog: Catalog) -> None:
+    # 03-10 is unclosed at now = 03-10T01:00 and 03-11 is in the future: last bar is 03-09.
+    fake = exchange_with(days(date(2024, 3, 9), date(2024, 3, 11)))
+    result, _ = run(catalog, standard_responses(), fake, end=date(2024, 3, 20))
+    assert result.entry is not None
+    assert result.entry.last_ts == at(date(2024, 3, 9))
+    assert result.entry.rows == 69
+
+
+def test_ingest_instruments_deduplicates_symbols(catalog: Catalog) -> None:
+    fake = FakeExchange(markets=[spot_market(), perp_market()])
+    out = ingest_instruments(catalog, fake, ["BTCUSDT", "BTCUSDT"], ["spot", "perp"], NOW)
+    assert [i.symbol for i in out] == ["BTCUSDT", "BTCUSDT-PERP"]
+    assert len(catalog.read_instruments()[0]) == 2
