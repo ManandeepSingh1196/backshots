@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from enum import StrEnum
 from types import MappingProxyType
+from typing import Protocol
 
 from bt.core.clock import ensure_utc
 from bt.core.errors import InvariantError
@@ -324,3 +325,58 @@ class Step:
     ) -> tuple[type["Step"], tuple[datetime, dict[str, Bar], tuple[FundingEvent, ...]]]:
         # MappingProxyType is not picklable; rebuild through __init__ so invariants re-run.
         return (Step, (self.ts, dict(self.bars), tuple(self.funding)))
+
+
+@dataclass(frozen=True, slots=True)
+class OrderAck:
+    """Broker's immediate answer to a submitted order.
+
+    Invariants: order_id non-empty; status is an OrderStatus; reason is non-empty
+    exactly when status is REJECTED or CANCELED.
+    """
+
+    order_id: str
+    status: OrderStatus
+    reason: str = ""
+
+    def __post_init__(self) -> None:
+        owner = f"OrderAck {self.order_id}"
+        object.__setattr__(
+            self, "status", _coerce(OrderStatus, self.status, owner, "status", "order status")
+        )
+        _require(bool(self.order_id), "OrderAck.order_id must be non-empty")
+        has_reason = self.status in (OrderStatus.REJECTED, OrderStatus.CANCELED)
+        _require(
+            has_reason == (self.reason != ""),
+            f"{owner}: reason must be set exactly when status is rejected or canceled",
+        )
+
+
+class PortfolioView(Protocol):
+    """Read-only portfolio state shared by validator, broker, context and live."""
+
+    @property
+    def ts(self) -> datetime | None:
+        """Last mark time; None before the first mark."""
+        ...
+
+    @property
+    def cash(self) -> float: ...
+
+    @property
+    def available_cash(self) -> float:
+        """Cash that may be spent now; equals cash in M2."""
+        ...
+
+    @property
+    def equity(self) -> float:
+        """Cash plus sum of qty * last mark."""
+        ...
+
+    def position(self, symbol: str) -> PositionView:
+        """Position for symbol; a flat view (all zeros) if none."""
+        ...
+
+    def positions(self) -> Mapping[str, PositionView]:
+        """Non-flat positions only, keys sorted by symbol."""
+        ...
