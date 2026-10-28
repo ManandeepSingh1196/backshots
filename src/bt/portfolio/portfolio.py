@@ -52,6 +52,7 @@ class Portfolio:
         self._marks: dict[str, float] = {}
         self._cash = initial_cash
         self._ts: datetime | None = None
+        self._last_event_ts: datetime | None = None  # latest accepted fill or mark
         self._fees_paid = 0.0
         self._slippage_paid = 0.0
         self._realized = 0.0
@@ -99,10 +100,10 @@ class Portfolio:
         pos = self._pos.get(fill.symbol)
         if pos is None:
             raise PortfolioError(f"fill {fill.order_id}: unknown symbol {fill.symbol!r}")
-        if self._ts is not None and fill.ts < self._ts:
+        if self._last_event_ts is not None and fill.ts < self._last_event_ts:
             raise PortfolioError(
-                f"fill {fill.order_id}: ts {fill.ts.isoformat()} before last mark "
-                f"{self._ts.isoformat()}"
+                f"fill {fill.order_id}: ts {fill.ts.isoformat()} before last event "
+                f"{self._last_event_ts.isoformat()}"
             )
         step = self._steps[fill.symbol]
         notional = fill.qty * fill.price
@@ -115,16 +116,19 @@ class Portfolio:
             new_qty = pos.qty + fill.qty
             new_avg = (pos.qty * pos.avg_entry + notional) / new_qty
             new_realized = self._realized
+            trade_pnl = 0.0
         else:
             new_qty = pos.qty - fill.qty
-            if new_qty < -_QTY_REL_TOL * step:
+            tol = _QTY_REL_TOL * max(step, abs(pos.qty)) + math.ulp(pos.qty)
+            if new_qty < -tol:
                 raise PortfolioError(
                     f"fill {fill.order_id}: sell {fill.qty!r} exceeds holding {pos.qty!r}"
                 )
             new_cash = self._cash + notional - fill.fee
             new_avg = pos.avg_entry
-            new_realized = self._realized + (fill.price - pos.avg_entry) * fill.qty
-            if abs(new_qty) <= _QTY_REL_TOL * step:
+            trade_pnl = (fill.price - pos.avg_entry) * fill.qty
+            new_realized = self._realized + trade_pnl
+            if abs(new_qty) <= tol:
                 new_qty = 0.0
                 new_avg = 0.0
         # All checks passed: mutate.
@@ -132,6 +136,8 @@ class Portfolio:
         pos.qty = new_qty
         pos.avg_entry = new_avg
         self._realized = new_realized
+        pos.realized_pnl += trade_pnl
+        self._last_event_ts = fill.ts
         self._fees_paid += fill.fee
         self._slippage_paid += fill.slippage_cost
         self._marks.setdefault(fill.symbol, fill.price)
@@ -139,17 +145,18 @@ class Portfolio:
     def mark(self, ts: datetime, prices: Mapping[str, float]) -> None:
         """Mark to market; symbols missing from prices keep their previous mark."""
         ts = ensure_utc(ts, "mark ts")
-        if self._ts is not None and ts < self._ts:
+        if self._last_event_ts is not None and ts < self._last_event_ts:
             raise PortfolioError(
-                f"mark ts {ts.isoformat()} before last mark {self._ts.isoformat()}"
+                f"mark ts {ts.isoformat()} before last event {self._last_event_ts.isoformat()}"
             )
         for sym, price in prices.items():
             if sym not in self._pos:
                 raise PortfolioError(f"mark: unknown symbol {sym!r}")
             if not math.isfinite(price) or price <= 0:
                 raise PortfolioError(f"mark: bad price for {sym}: {price!r}")
-        self._marks.update(prices)
+        self._marks.update({sym: float(price) for sym, price in prices.items()})
         self._ts = ts
+        self._last_event_ts = ts
 
     def snapshot(self) -> EquitySnapshot:
         """Equity snapshot at the last mark; raises PortfolioError before the first mark."""
@@ -175,7 +182,7 @@ class Portfolio:
 class _PortfolioViewProxy:
     """Read-only live window onto a Portfolio; exposes exactly the PortfolioView members."""
 
-    __slots__ = ("_p",)
+    __slots__ = ("_p",)  # private reference to the live Portfolio; strategies must not use it
 
     def __init__(self, portfolio: Portfolio) -> None:
         self._p = portfolio

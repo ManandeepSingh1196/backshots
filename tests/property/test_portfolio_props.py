@@ -47,6 +47,9 @@ op_st = st.tuples(
 )
 
 
+FLAT_COUNT = {"flat": 0, "total": 0}
+
+
 def _tol(x: float, rel: float) -> float:
     return rel * max(1.0, abs(x))
 
@@ -78,6 +81,7 @@ def test_accounting_invariants(
     expected_cash = START
     notional_sum = 0.0
     n = 0
+    p.mark(ts, {SYMS[0]: 1.0})  # early mark so later fills are ordered against it
     for kind, sym, nsteps, price, feef, frac, days, price2 in ops:
         step = STEPS[sym]
         n += 1
@@ -134,6 +138,38 @@ def test_accounting_invariants(
         assert p.cash == pytest.approx(expected_cash, abs=_tol(notional_sum, 1e-7))  # P4
         for s_ in SYMS:
             assert p.position(s_).qty == pytest.approx(held[s_] * STEPS[s_], abs=1e-9)
+    for sym in SYMS:  # final close-out of everything still held
+        if held[sym]:
+            qty = held[sym] * STEPS[sym]
+            p.apply_fill(Fill(f"c{sym}", sym, ts, Side.SELL, qty, 10.0, 0.0, 0.0, False))
+            held[sym] = 0
+    _check_invariants(p)
+    FLAT_COUNT["total"] += 1
+    if len(p.positions()) == 0:
+        FLAT_COUNT["flat"] += 1
+
+
+def test_enough_examples_end_flat() -> None:
+    # Runs after test_accounting_invariants (definition order) in the same module.
+    assert FLAT_COUNT["total"] > 0
+    assert FLAT_COUNT["flat"] >= 0.25 * FLAT_COUNT["total"]
+
+
+@settings(derandomize=True, max_examples=2000, deadline=None)
+@given(
+    st.lists(st.integers(1, 5_000_000), min_size=10, max_size=10),
+    st.floats(0.5, 1e5),
+)
+def test_sell_of_summed_grid_buys_closes_exactly(nsteps: list[int], price: float) -> None:
+    p = Portfolio(1e18, [_inst("AAAUSDT")])
+    total = 0.0
+    for i, n in enumerate(nsteps):
+        qty = n * 0.001
+        p.apply_fill(Fill(f"b{i}", "AAAUSDT", T0, Side.BUY, qty, price, 0.0, 0.0, False))
+        total += qty
+    p.apply_fill(Fill("s", "AAAUSDT", T0, Side.SELL, total, price, 0.0, 0.0, False))
+    assert p.position("AAAUSDT").qty == 0.0
+    assert len(p.positions()) == 0
 
 
 @SETTINGS

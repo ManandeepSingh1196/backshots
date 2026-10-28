@@ -192,3 +192,52 @@ def test_instances_independent_and_positions_read_only() -> None:
     assert b.cash == 1000.0
     with pytest.raises(TypeError):
         a.positions()["X"] = a.position("AAAUSDT")  # type: ignore[index]
+
+
+def test_oversell_within_tolerance_snaps_to_zero() -> None:
+    p = mk()
+    p.apply_fill(fill("AAAUSDT", Side.BUY, 1000.0, 1.0, 0.0))
+    # 1e-9 * max(step, 1000) = 1e-6 tolerance; exceed holdings by 5e-7.
+    p.apply_fill(fill("AAAUSDT", Side.SELL, 1000.0 + 5e-7, 1.0, 0.0))
+    assert p.position("AAAUSDT").qty == 0.0
+    assert len(p.positions()) == 0
+    p2 = mk()
+    p2.apply_fill(fill("AAAUSDT", Side.BUY, 1000.0, 1.0, 0.0))
+    with pytest.raises(PortfolioError):
+        p2.apply_fill(fill("AAAUSDT", Side.SELL, 1000.0 + 1e-5, 1.0, 0.0))
+
+
+def test_event_ordering_fill_and_mark() -> None:
+    p = mk()
+    p.apply_fill(fill("AAAUSDT", Side.BUY, 1.0, 100.0, 0.0, T3))
+    with pytest.raises(PortfolioError):
+        p.mark(T2, {"AAAUSDT": 100.0})
+    with pytest.raises(PortfolioError):
+        p.apply_fill(fill("AAAUSDT", Side.BUY, 1.0, 100.0, 0.0, T2))
+    assert p.ts is None
+    p.apply_fill(fill("AAAUSDT", Side.BUY, 1.0, 100.0, 0.0, T3))  # equal ts ok
+    p.mark(T3, {"AAAUSDT": 100.0})  # equal ts ok
+    with pytest.raises(PortfolioError):
+        p.apply_fill(fill("AAAUSDT", Side.SELL, 1.0, 100.0, 0.0, T2))
+
+
+def test_position_realized_pnl_matches_total() -> None:
+    p = mk()
+    p.apply_fill(fill("AAAUSDT", Side.BUY, 5.0, 102.102, 0.51051, T1, 0.51))
+    p.apply_fill(fill("AAAUSDT", Side.SELL, 2.0, 107.892, 0.215784, T2))
+    p.apply_fill(fill("AAAUSDT", Side.BUY, 1.0, 112.5, 0.1125, T3))
+    p.apply_fill(fill("AAAUSDT", Side.SELL, 4.0, 113.886, 0.455544, T4))
+    p.mark(T4, {"AAAUSDT": 115.0})
+    # The ticket says BBB, but the T015 round trip trades AAAUSDT.
+    assert p._pos["AAAUSDT"].realized_pnl == pytest.approx(48.318, abs=1e-9)  # pyright: ignore[reportPrivateUsage]
+    assert p._pos["BBBUSDT"].realized_pnl == 0.0  # pyright: ignore[reportPrivateUsage]
+    assert p.snapshot().realized_pnl == pytest.approx(48.318, abs=1e-9)
+
+
+def test_mark_stores_float() -> None:
+    import numpy as np
+
+    p = mk()
+    p.apply_fill(fill("AAAUSDT", Side.BUY, 1.0, 100.0, 0.0))
+    p.mark(T1, {"AAAUSDT": np.float64(110.0)})
+    assert type(p._marks["AAAUSDT"]) is float  # pyright: ignore[reportPrivateUsage]
