@@ -92,7 +92,7 @@ def test_4h_gap_and_grid() -> None:
     r2 = validate_klines(off, "4h", "x")
     assert not r2.ok
     assert any("grid" in e for e in r2.errors)
-    assert r2.gaps == ()  # no wrong grid -> no gaps computed beyond diff <= delta
+    assert r2.gaps == ()  # 00:00 and 01:00 are less than 4h apart, so no gap
 
 
 def test_duplicate_and_unsorted() -> None:
@@ -130,14 +130,51 @@ def test_empty() -> None:
 
 
 def test_price_errors() -> None:
-    assert not validate_klines(daily([0], high=104.0), "1d", "x").ok
-    assert not validate_klines(daily([0], low=106.0), "1d", "x").ok
-    assert not validate_klines(daily([0], close=0.0), "1d", "x").ok
-    assert not validate_klines(daily([0], volume=-1.0), "1d", "x").ok
-    assert not validate_klines(daily([0], quote_volume=-1.0), "1d", "x").ok
-    assert not validate_klines(daily([0], trades=-1), "1d", "x").ok
-    # high < low with open/close inside neither bound
-    assert not validate_klines(daily([0], high=80.0, low=95.0, open=90.0, close=90.0), "1d", "x").ok
+    first = "2024-01-01T00:00:00+00:00"
+    cases: list[tuple[dict[str, float], str]] = [
+        ({"high": 104.0}, "high below open/close"),
+        ({"low": 106.0}, "low above open/close"),
+        ({"close": 0.0}, "non-positive close"),
+        ({"volume": -1.0}, "negative volume"),
+        ({"quote_volume": -1.0}, "negative quote_volume"),
+        ({"trades": -1}, "negative trades"),
+        ({"high": 80.0, "low": 95.0, "open": 90.0, "close": 90.0}, "high below low"),
+    ]
+    for over, msg in cases:
+        errors = validate_klines(daily([0, 1], **over), "1d", "x").errors
+        assert f"{msg}: 2 rows, first {first}" in errors, (over, errors)
+
+
+def test_non_finite_klines() -> None:
+    first = "2024-01-02T00:00:00+00:00"
+    for col in ("open", "high", "low", "close", "volume", "quote_volume"):
+        for bad in (float("nan"), float("inf")):
+            df = klines([{"ts": D(0)}, {"ts": D(1), col: bad}])
+            r = validate_klines(df, "1d", "x")
+            assert not r.ok, (col, bad)
+            assert f"non-finite {col}: 1 rows, first {first}" in r.errors, (col, bad, r.errors)
+
+
+def test_non_finite_no_flags() -> None:
+    nan_close = klines([{"ts": D(0)}, {"ts": D(1), "close": float("nan")}])
+    assert all(f.reason != "jump" for f in validate_klines(nan_close, "1d", "x").flags)
+    inf_close = klines([{"ts": D(0)}, {"ts": D(1), "close": float("inf")}])
+    assert all(f.reason != "jump" for f in validate_klines(inf_close, "1d", "x").flags)
+    inf_high = klines([{"ts": D(0), "high": float("inf")}])
+    assert all(f.reason != "wide_range" for f in validate_klines(inf_high, "1d", "x").flags)
+
+
+def test_non_finite_funding() -> None:
+    for col in ("rate", "mark_price"):
+        for bad in (float("nan"), float("inf")):
+            df = funding([{"ts": H(0)}, {"ts": H(8), col: bad}])
+            r = validate_funding(df, "x")
+            assert not r.ok, (col, bad)
+            assert any(e.startswith(f"non-finite {col}: 1 rows, first ") for e in r.errors)
+    inf_rate = validate_funding(funding([{"ts": H(0), "rate": float("inf")}]), "x")
+    assert inf_rate.flags == ()
+    nan_rate = validate_funding(funding([{"ts": H(0), "rate": float("nan")}]), "x")
+    assert nan_rate.flags == ()
 
 
 def test_null_close_named() -> None:
