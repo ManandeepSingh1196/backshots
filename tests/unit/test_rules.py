@@ -110,6 +110,11 @@ def test_round_qty_down_errors(bad: float) -> None:
         round_qty_down(bad, AAA)
 
 
+def test_round_qty_down_too_large() -> None:
+    with pytest.raises(ExecutionError):
+        round_qty_down(1e30, AAA)
+
+
 def test_round_price() -> None:
     assert round_price(100.004, AAA, Side.BUY) == 100.01
     assert round_price(100.004, AAA, Side.SELL) == 100.0
