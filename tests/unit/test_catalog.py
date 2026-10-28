@@ -2,13 +2,50 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
+from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, cast
+from zoneinfo import ZoneInfo
 
+import polars as pl
 import pytest
 
-from bt.core.errors import DataError
-from bt.data.catalog import Catalog
+from bt.core.errors import DataError, DataValidationError, TimezoneError
+from bt.data.catalog import Catalog, ManifestEntry
+from bt.data.validate import KLINE_SCHEMA
+
+D0 = datetime(2024, 1, 1, tzinfo=UTC)
+T0 = datetime(2024, 3, 10, 12, tzinfo=UTC)
+SRC = ("https://data.binance.vision/x.zip",)
+SUMS = {"https://data.binance.vision/x.zip": "ab" * 32}
+
+
+def D(n: int) -> datetime:  # noqa: N802
+    return D0 + timedelta(days=n)
+
+
+def klines_df(n: int = 5, step: timedelta = timedelta(days=1)) -> pl.DataFrame:
+    return pl.DataFrame(
+        {
+            "ts": [D0 + i * step for i in range(n)],
+            "open": [100.0 + i for i in range(n)],
+            "high": [110.0 + i for i in range(n)],
+            "low": [90.0 + i for i in range(n)],
+            "close": [105.0 + i for i in range(n)],
+            "volume": [10.0] * n,
+            "quote_volume": [1000.0] * n,
+            "trades": list(range(1, n + 1)),
+        },
+        schema=dict(KLINE_SCHEMA),
+    )
+
+
+def put(cat: Catalog, df: pl.DataFrame | None = None, at: datetime = T0) -> ManifestEntry:
+    return cat.write_klines(
+        "perp", "1d", "BTCUSDT", klines_df() if df is None else df, SRC, SUMS, at
+    )
 
 
 def test_paths(tmp_path: Path) -> None:
@@ -36,3 +73,177 @@ def test_bad_market_and_timeframe_rejected(tmp_path: Path) -> None:
         cat.klines_path(cast(Any, "futures"), "1d", "BTCUSDT")
     with pytest.raises(DataError):
         cat.klines_path("perp", cast(Any, "1h"), "BTCUSDT")
+
+
+def test_klines_round_trip(tmp_path: Path) -> None:
+    cat = Catalog(tmp_path)
+    df = klines_df()
+    put(cat, df)
+    back = cat.read_klines("perp", "1d", "BTCUSDT")
+    assert back.equals(df)
+    assert list(back.schema.items()) == list(KLINE_SCHEMA.items())
+
+
+def test_entry_and_manifest(tmp_path: Path) -> None:
+    cat = Catalog(tmp_path)
+    entry = put(cat)
+    path = cat.klines_path("perp", "1d", "BTCUSDT")
+    assert entry.path == "binance/perp/klines/1d/BTCUSDT.parquet"
+    assert entry.rows == 5
+    assert entry.first_ts == D(0)
+    assert entry.last_ts == D(4)
+    assert entry.ingested_at == T0
+    assert entry.sources == SRC
+    assert dict(entry.checksums) == SUMS
+    assert entry.sha256 == hashlib.sha256(path.read_bytes()).hexdigest()
+    assert cat.manifest()[entry.path] == entry
+
+
+def test_second_dataset_keeps_first(tmp_path: Path) -> None:
+    cat = Catalog(tmp_path)
+    first = put(cat)
+    cat.write_klines("spot", "4h", "ETHUSDT", klines_df(step=timedelta(hours=4)), (), {}, T0)
+    m = cat.manifest()
+    assert len(m) == 2
+    assert m[first.path] == first
+    assert "binance/spot/klines/4h/ETHUSDT.parquet" in m
+
+
+def test_invalid_frame_touches_nothing(tmp_path: Path) -> None:
+    cat = Catalog(tmp_path)
+    put(cat)
+    path = cat.klines_path("perp", "1d", "BTCUSDT")
+    manifest = tmp_path / "manifest.json"
+    before = (path.read_bytes(), manifest.read_bytes())
+    bad = pl.concat([klines_df(), klines_df(1)])
+    with pytest.raises(DataValidationError) as ei:
+        put(cat, bad)
+    assert "perp/klines/1d/BTCUSDT" in str(ei.value)
+    assert "duplicate" in str(ei.value)
+    assert (path.read_bytes(), manifest.read_bytes()) == before
+
+
+def test_invalid_frame_on_fresh_root_creates_nothing(tmp_path: Path) -> None:
+    cat = Catalog(tmp_path / "root")
+    with pytest.raises(DataValidationError):
+        put(cat, pl.concat([klines_df(), klines_df(1)]))
+    assert not (tmp_path / "root").exists()
+
+
+def test_atomic_write_failure(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    cat = Catalog(tmp_path)
+    put(cat)
+    path = cat.klines_path("perp", "1d", "BTCUSDT")
+    manifest = tmp_path / "manifest.json"
+    before = (path.read_bytes(), manifest.read_bytes())
+
+    def boom(self: pl.DataFrame, file: Path, *args: object, **kwargs: object) -> None:
+        Path(file).write_bytes(b"partial")
+        raise OSError("disk full")
+
+    monkeypatch.setattr(pl.DataFrame, "write_parquet", boom)
+    with pytest.raises(OSError, match="disk full"):
+        put(cat, klines_df(3))
+    assert (path.read_bytes(), manifest.read_bytes()) == before
+    assert sorted(p.name for p in path.parent.iterdir()) == ["BTCUSDT.parquet"]
+    assert sorted(p.name for p in tmp_path.iterdir() if p.is_file()) == ["manifest.json"]
+
+
+def test_naive_ingested_at(tmp_path: Path) -> None:
+    with pytest.raises(TimezoneError):
+        put(Catalog(tmp_path), at=datetime(2024, 3, 10, 12))  # noqa: DTZ001
+
+
+def test_ingested_at_normalised_before_storing(tmp_path: Path) -> None:
+    cat = Catalog(tmp_path)
+    entry = put(cat, at=datetime(2024, 3, 10, 12, tzinfo=ZoneInfo("Europe/London")))
+    assert entry.ingested_at.tzinfo is UTC
+    with pytest.raises(TimezoneError):
+        put(cat, at=datetime(2024, 3, 10, 12, tzinfo=timezone(timedelta(hours=2))))
+
+
+def test_determinism(tmp_path: Path) -> None:
+    a, b = Catalog(tmp_path / "a"), Catalog(tmp_path / "b")
+    ea, eb = put(a), put(b)
+    assert a.klines_path("perp", "1d", "BTCUSDT").read_bytes() == (
+        b.klines_path("perp", "1d", "BTCUSDT").read_bytes()
+    )
+    assert (tmp_path / "a/manifest.json").read_bytes() == (
+        tmp_path / "b/manifest.json"
+    ).read_bytes()
+    assert ea.sha256 == eb.sha256
+
+
+def test_manifest_json_format(tmp_path: Path) -> None:
+    cat = Catalog(tmp_path)
+    entry = put(cat)
+    text = (tmp_path / "manifest.json").read_text()
+    assert text.endswith("}\n")
+    doc = json.loads(text)
+    assert doc["version"] == 1
+    f = doc["files"][entry.path]
+    assert f["first_ts"] == "2024-01-01T00:00:00+00:00"
+    assert f["sha256"] == entry.sha256
+    assert f["sources"] == list(SRC)
+
+
+def test_missing_and_empty(tmp_path: Path) -> None:
+    cat = Catalog(tmp_path)
+    assert cat.manifest() == {}
+    with pytest.raises(DataError, match="BTCUSDT"):
+        cat.read_klines("perp", "1d", "BTCUSDT")
+
+
+def test_manifest_unknown_version(tmp_path: Path) -> None:
+    (tmp_path / "manifest.json").write_text('{"version": 2, "files": {}}\n')
+    with pytest.raises(DataError, match="version"):
+        Catalog(tmp_path).manifest()
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "{",
+        "[]",
+        '{"version": 1}',
+        '{"version": 1, "files": {"a": {"path": "a"}}}',
+        '{"version": 1, "files": {"a": 3}}',
+    ],
+)
+def test_manifest_corrupt(tmp_path: Path, text: str) -> None:
+    (tmp_path / "manifest.json").write_text(text)
+    with pytest.raises(DataError, match=r"manifest\.json"):
+        Catalog(tmp_path).manifest()
+
+
+def test_manifest_bad_entry_types(tmp_path: Path) -> None:
+    cat = Catalog(tmp_path)
+    entry = put(cat)
+    doc = json.loads((tmp_path / "manifest.json").read_text())
+    doc["files"][entry.path]["rows"] = "5"
+    (tmp_path / "manifest.json").write_text(json.dumps(doc))
+    with pytest.raises(DataError):
+        cat.manifest()
+    doc["files"][entry.path]["rows"] = 5
+    doc["files"][entry.path]["first_ts"] = "2024-01-01T00:00:00"
+    (tmp_path / "manifest.json").write_text(json.dumps(doc))
+    with pytest.raises(DataError):
+        cat.manifest()
+
+
+def test_read_klines_wrong_schema(tmp_path: Path) -> None:
+    cat = Catalog(tmp_path)
+    put(cat)
+    path = cat.klines_path("perp", "1d", "BTCUSDT")
+    pl.read_parquet(path).with_columns(pl.col("ts").dt.cast_time_unit("ms")).write_parquet(path)
+    with pytest.raises(DataError, match=r"BTCUSDT\.parquet"):
+        cat.read_klines("perp", "1d", "BTCUSDT")
+
+
+def test_read_klines_garbage_file(tmp_path: Path) -> None:
+    cat = Catalog(tmp_path)
+    path = cat.klines_path("perp", "1d", "BTCUSDT")
+    path.parent.mkdir(parents=True)
+    path.write_bytes(b"not parquet")
+    with pytest.raises(DataError):
+        cat.read_klines("perp", "1d", "BTCUSDT")

@@ -2,14 +2,31 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+import hashlib
+import json
+import os
+import tempfile
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import get_args
+from typing import Final, cast, get_args
 
-from bt.core.errors import DataError
-from bt.data.validate import Market, Timeframe, check_symbol
+import polars as pl
+
+from bt.core.clock import ensure_utc
+from bt.core.errors import DataError, DataValidationError
+from bt.data.validate import (
+    KLINE_SCHEMA,
+    Market,
+    Timeframe,
+    ValidationReport,
+    check_symbol,
+    validate_klines,
+)
+
+_MANIFEST_VERSION: Final = 1
+_FILE_MODE: Final = 0o644
 
 
 @dataclass(frozen=True, slots=True)
@@ -30,6 +47,10 @@ class ManifestEntry:
     sha256: str
 
 
+class _UnknownVersionError(Exception):
+    """Internal: manifest version is not supported."""
+
+
 def _check_market(market: str) -> None:
     if market not in get_args(Market):
         raise DataError(f"invalid market {market!r}: expected one of {get_args(Market)}")
@@ -38,6 +59,101 @@ def _check_market(market: str) -> None:
 def _check_timeframe(timeframe: str) -> None:
     if timeframe not in get_args(Timeframe):
         raise DataError(f"invalid timeframe {timeframe!r}: expected one of {get_args(Timeframe)}")
+
+
+def _atomic_write(path: Path, write: Callable[[Path], None]) -> None:
+    """Run `write(tmp)` on a temp file beside `path`, then os.replace it into place.
+
+    On any exception the temp file is removed and `path` is left as it was.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")
+    os.close(fd)
+    tmp = Path(tmp_name)
+    try:
+        write(tmp)
+        os.chmod(tmp, _FILE_MODE)
+        os.replace(tmp, path)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
+
+
+def _write_text(path: Path, text: str) -> None:
+    path.write_text(text, encoding="utf-8")
+
+
+def _atomic_write_text(path: Path, text: str) -> None:
+    _atomic_write(path, lambda tmp: _write_text(tmp, text))
+
+
+def _entry_to_json(entry: ManifestEntry) -> dict[str, object]:
+    return {
+        "path": entry.path,
+        "sources": list(entry.sources),
+        "checksums": dict(sorted(entry.checksums.items())),
+        "rows": entry.rows,
+        "first_ts": entry.first_ts.isoformat(),
+        "last_ts": entry.last_ts.isoformat(),
+        "ingested_at": entry.ingested_at.isoformat(),
+        "sha256": entry.sha256,
+    }
+
+
+def _str(value: object, name: str) -> str:
+    if not isinstance(value, str):
+        raise TypeError(f"{name} must be a string, got {value!r}")
+    return value
+
+
+def _dt(value: object, name: str) -> datetime:
+    return ensure_utc(datetime.fromisoformat(_str(value, name)), name)
+
+
+def _obj(value: object, name: str) -> dict[str, object]:
+    if not isinstance(value, dict):
+        raise TypeError(f"{name} must be an object, got {type(value).__name__}")
+    items = cast(dict[object, object], value)
+    return {_str(k, f"{name} key"): v for k, v in items.items()}
+
+
+def _list(value: object, name: str) -> list[object]:
+    if not isinstance(value, list):
+        raise TypeError(f"{name} must be a list, got {type(value).__name__}")
+    return list(cast(list[object], value))
+
+
+def _entry_from_json(raw: object) -> ManifestEntry:
+    d = _obj(raw, "manifest entry")
+    rows = d["rows"]
+    if not isinstance(rows, int) or isinstance(rows, bool):
+        raise TypeError(f"rows must be an int, got {rows!r}")
+    return ManifestEntry(
+        path=_str(d["path"], "path"),
+        sources=tuple(_str(x, "sources[]") for x in _list(d["sources"], "sources")),
+        checksums={k: _str(v, "checksums value") for k, v in _obj(d["checksums"], "checksums").items()},
+        rows=rows,
+        first_ts=_dt(d["first_ts"], "first_ts"),
+        last_ts=_dt(d["last_ts"], "last_ts"),
+        ingested_at=_dt(d["ingested_at"], "ingested_at"),
+        sha256=_str(d["sha256"], "sha256"),
+    )
+
+
+def _schema_matches(df: pl.DataFrame, expected: Mapping[str, pl.DataType]) -> bool:
+    return list(df.schema.items()) == list(expected.items())
+
+
+def _read_parquet(path: Path, expected: Mapping[str, pl.DataType]) -> pl.DataFrame:
+    if not path.is_file():
+        raise DataError(f"dataset not found: {path}")
+    try:
+        df = pl.read_parquet(path)
+    except (pl.exceptions.PolarsError, OSError) as e:
+        raise DataError(f"cannot read {path}: {e}") from e
+    if not _schema_matches(df, expected):
+        raise DataError(f"schema of {path} does not match the expected schema: {dict(df.schema)}")
+    return df
 
 
 class Catalog:
@@ -66,3 +182,80 @@ class Catalog:
 
     def cache_dir(self) -> Path:
         return self._root / "cache"
+
+    def manifest(self) -> Mapping[str, ManifestEntry]:
+        path = self._manifest_path()
+        if not path.exists():
+            return {}
+        try:
+            raw: object = json.loads(path.read_text(encoding="utf-8"))
+            top = _obj(raw, "manifest")
+            version = top["version"]
+            files = top["files"]
+            if version != _MANIFEST_VERSION or isinstance(version, bool):
+                raise _UnknownVersionError(f"unsupported manifest version {version!r}")
+            entries = [_entry_from_json(v) for v in _obj(files, "files").values()]
+        except _UnknownVersionError as e:
+            raise DataError(f"{path}: {e}") from e
+        except (KeyError, TypeError, ValueError, OSError) as e:
+            raise DataError(f"cannot parse manifest {path}: {e!r}") from e
+        return {e.path: e for e in entries}
+
+    def write_klines(
+        self,
+        market: Market,
+        timeframe: Timeframe,
+        symbol: str,
+        df: pl.DataFrame,
+        sources: Sequence[str],
+        checksums: Mapping[str, str],
+        ingested_at: datetime,
+    ) -> ManifestEntry:
+        path = self.klines_path(market, timeframe, symbol)
+        dataset = f"{market}/klines/{timeframe}/{symbol}"
+        report = validate_klines(df, timeframe, dataset)
+        return self._store(path, df, report, sources, checksums, ingested_at)
+
+    def read_klines(self, market: Market, timeframe: Timeframe, symbol: str) -> pl.DataFrame:
+        return _read_parquet(self.klines_path(market, timeframe, symbol), KLINE_SCHEMA)
+
+    def _manifest_path(self) -> Path:
+        return self._root / "manifest.json"
+
+    def _store(
+        self,
+        path: Path,
+        df: pl.DataFrame,
+        report: ValidationReport,
+        sources: Sequence[str],
+        checksums: Mapping[str, str],
+        ingested_at: datetime,
+    ) -> ManifestEntry:
+        ingested = ensure_utc(ingested_at, "ingested_at")
+        if not report.ok:
+            raise DataValidationError(f"{report.dataset} failed validation: " + "; ".join(report.errors))
+        assert report.first_ts is not None and report.last_ts is not None
+        digest: list[str] = []
+
+        def write(tmp: Path) -> None:
+            df.write_parquet(tmp, compression="zstd", statistics=True)
+            digest.append(hashlib.sha256(tmp.read_bytes()).hexdigest())
+
+        _atomic_write(path, write)
+        entry = ManifestEntry(
+            path=path.relative_to(self._root).as_posix(),
+            sources=tuple(sources),
+            checksums=dict(sorted(checksums.items())),
+            rows=report.rows,
+            first_ts=report.first_ts,
+            last_ts=report.last_ts,
+            ingested_at=ingested,
+            sha256=digest[-1],
+        )
+        files = {p: _entry_to_json(e) for p, e in self.manifest().items()}
+        files[entry.path] = _entry_to_json(entry)
+        doc = {"version": _MANIFEST_VERSION, "files": files}
+        _atomic_write_text(
+            self._manifest_path(), json.dumps(doc, indent=2, sort_keys=True) + "\n"
+        )
+        return entry
