@@ -337,8 +337,9 @@ def _ro(a: np.ndarray) -> np.ndarray:
 
 
 def test_toctou_ts_property_read_once() -> None:
-    good = _hist(CLOSES[:3])
-    leaked = _hist(CLOSES[:4])
+    day3 = _ro(np.array(["2024-01-03"], dtype="datetime64[us]"))
+    day4 = _ro(np.array(["2024-01-04"], dtype="datetime64[us]"))
+    one = _ro(np.array([1.0]))
 
     class Flip:
         def __init__(self) -> None:
@@ -347,17 +348,12 @@ def test_toctou_ts_property_read_once() -> None:
         @property
         def ts(self) -> np.ndarray:
             self.reads += 1
-            return good.ts if self.reads == 1 else leaked.ts
+            return day3 if self.reads == 1 else day4
 
-        open = good.open
-        high = good.high
-        low = good.low
-        close = good.close
-        volume = good.volume
+        open = high = low = close = volume = one
 
-    # Whatever is read first is what is checked and returned: never a second, longer read.
-    out = _ctx(_Src(Flip())).history("AAAUSDT", 3)
-    assert len(out.ts) == 3
+    out = _ctx(_Src(Flip())).history("AAAUSDT", 1)
+    assert out.ts[0] == np.datetime64("2024-01-03", "us")
 
 
 def test_non_datetime_ts_rejected() -> None:
