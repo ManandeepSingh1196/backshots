@@ -1,6 +1,9 @@
+import copy
 import dataclasses
+import pickle
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
+from types import MappingProxyType
 from zoneinfo import ZoneInfo
 
 import pytest
@@ -457,3 +460,82 @@ def test_step_snapshots_inputs() -> None:
 def test_order_unknown_type_rejected() -> None:
     with pytest.raises(InvariantError, match="unknown order type"):
         make_order(type="bogus")
+
+
+# ---- enum coercion ----
+
+
+def test_instrument_kind_coerced_from_str() -> None:
+    assert make_instrument(kind="spot").kind is InstrumentKind.SPOT
+    inst = make_instrument(kind="perp", max_leverage=5, maint_margin_rate=0.01)
+    assert inst.kind is InstrumentKind.PERP
+
+
+@pytest.mark.parametrize("bad", ["SPOT", "Spot", "bogus"])
+def test_instrument_kind_bad_value_raises(bad: str) -> None:
+    with pytest.raises(InvariantError, match="kind") as ei:
+        make_instrument(kind=bad)
+    assert isinstance(ei.value.__cause__, ValueError)
+
+
+def test_uppercase_spot_cannot_bypass_spot_invariants() -> None:
+    with pytest.raises(InvariantError):
+        make_instrument(kind="SPOT", max_leverage=5)
+
+
+def test_order_side_and_type_coerced() -> None:
+    assert make_order(side="buy").side is Side.BUY
+    assert make_order(type="market").type is OrderType.MARKET
+
+
+def test_order_bad_side_and_type_raise() -> None:
+    with pytest.raises(InvariantError, match="side"):
+        make_order(side="bogus")
+    with pytest.raises(InvariantError, match="type"):
+        make_order(type="bogus")
+    with pytest.raises(InvariantError, match="type"):
+        make_order(type="STOP", stop_price=10.0)
+
+
+def test_fill_side_coerced() -> None:
+    assert make_fill(side="sell").side is Side.SELL
+    with pytest.raises(InvariantError, match="side"):
+        make_fill(side="SELL")
+
+
+def test_enum_member_identity_kept() -> None:
+    assert make_order(side=Side.BUY).side is Side.BUY
+    assert make_fill(side=Side.SELL).side is Side.SELL
+    assert make_order(type=OrderType.LIMIT, limit_price=1.0).type is OrderType.LIMIT
+    assert make_instrument(kind=InstrumentKind.PERP).kind is InstrumentKind.PERP
+
+
+# ---- Step pickling ----
+
+
+def _step() -> Step:
+    return Step(ts=T, bars={"BTCUSDT": make_bar()}, funding=[FundingEvent("BTCUSDT", T, 0.0001)])
+
+
+def test_step_pickle_round_trip() -> None:
+    step = _step()
+    out = pickle.loads(pickle.dumps(step))
+    assert out == step
+    assert isinstance(out.bars, MappingProxyType)
+    assert isinstance(out.funding, tuple)
+
+
+def test_step_deepcopy_and_copy() -> None:
+    step = _step()
+    for out in (copy.deepcopy(step), copy.copy(step)):
+        assert out == step
+        assert isinstance(out.bars, MappingProxyType)
+        with pytest.raises(TypeError):
+            out.bars["X"] = make_bar()  # type: ignore[index]
+
+
+def test_step_empty_bars_with_funding_pickles() -> None:
+    step = Step(ts=T, bars={}, funding=[FundingEvent("BTCUSDT", T, -0.0002)])
+    out = pickle.loads(pickle.dumps(step))
+    assert out == step
+    assert len(out.funding) == 1
