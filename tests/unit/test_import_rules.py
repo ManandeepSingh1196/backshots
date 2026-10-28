@@ -162,3 +162,45 @@ def test_every_package_imports(pkg: str) -> None:
     module = importlib.import_module(f"bt.{pkg}")
     assert module.__doc__
     assert module.__doc__.strip()
+
+
+@pytest.mark.parametrize(
+    ("rel", "code", "target"),
+    [
+        ("src/bt/core/a.py", "from .. import engine\n", "bt.engine"),
+        ("src/bt/core/b.py", "from bt import engine\n", "bt.engine"),
+        ("src/bt/costs/c.py", "import bt.engine.backtest as bk\n", "bt.engine.backtest"),
+        ("src/bt/strategy/d.py", "def f() -> None:\n    import bt.data\n", "bt.data"),
+        ("src/bt/strategy/e.py", "def f() -> None:\n    from bt.data import x\n", "bt.data"),
+        # three-level relative import from a nested package resolves to bt.engine
+        ("src/bt/core/sub/f.py", "from ...engine import x\n", "bt.engine"),
+        ("src/bt/core/sub/__init__.py", "from ... import engine\n", "bt.engine"),
+        ("src/bt/core/g.py", "from . import types\nimport bt.engine\n", "bt.engine"),
+    ],
+)
+def test_checker_hardening_single_violation(
+    tmp_path: Path, rel: str, code: str, target: str
+) -> None:
+    _write(tmp_path, rel, code)
+    violations = _run(tmp_path)
+    assert len(violations) == 1
+    assert target in violations[0]
+
+
+def test_three_level_relative_import_above_top_level_is_flagged(tmp_path: Path) -> None:
+    # `from ...bt.engine import x` in bt/core/a.py climbs above the top-level package
+    # (invalid at runtime). Documented behavior: the checker resolves it to bt.engine
+    # and flags it, which is the conservative choice.
+    _write(tmp_path, "src/bt/core/a.py", "from ...bt.engine import x\n")
+    violations = _run(tmp_path)
+    assert len(violations) == 1
+    assert "bt.engine" in violations[0]
+
+
+def test_checker_allows_same_package_relative_imports(tmp_path: Path) -> None:
+    _write(
+        tmp_path,
+        "src/bt/core/sub/h.py",
+        "from .. import types\nfrom ..errors import X\nfrom . import y\n",
+    )
+    assert _run(tmp_path) == []
