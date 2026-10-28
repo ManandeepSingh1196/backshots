@@ -6,6 +6,7 @@ Functions are pure or take an injected `httpx.Client`; nothing here builds its o
 from __future__ import annotations
 
 import calendar
+import csv
 import hashlib
 import io
 import os
@@ -19,10 +20,11 @@ from typing import Final
 from urllib.parse import urlparse
 
 import httpx
+import polars as pl
 from tenacity import RetryError, Retrying, retry_if_exception_type, stop_after_attempt, wait_exponential
 
 from bt.core.errors import ArchiveError, ChecksumMismatchError
-from bt.data.validate import Market, Timeframe, check_symbol
+from bt.data.validate import FUNDING_SCHEMA, KLINE_SCHEMA, Market, Timeframe, check_symbol
 
 ARCHIVE_BASE: Final = "https://data.binance.vision"
 MICROS_THRESHOLD: Final = 10**14  # raw ts >= this is microseconds, else milliseconds
@@ -249,3 +251,108 @@ def download_archive(client: httpx.Client, file: ArchiveFile, cache_dir: Path) -
     _atomic_write(zip_path, zip_bytes)
     _atomic_write(sum_path, sum_resp.content)
     return ArchiveData(file=file, sha256=actual, csv=csv)
+
+
+_KLINE_COLUMNS: Final = 12
+_FUNDING_HEADER: Final = ("calc_time", "funding_interval_hours", "last_funding_rate")
+_TS_DTYPE: Final = pl.Datetime("us", "UTC")
+
+
+def _rows(raw: bytes) -> list[tuple[int, list[str]]]:
+    """Non-blank CSV rows as (1-based line number, fields)."""
+    try:
+        text = raw.decode("utf-8-sig")
+    except UnicodeDecodeError as exc:
+        raise ArchiveError("CSV is not valid UTF-8") from exc
+    reader = csv.reader(io.StringIO(text))
+    return [(reader.line_num, row) for row in reader if row]
+
+
+def _is_int(field: str) -> bool:
+    try:
+        int(field)
+    except ValueError:
+        return False
+    return True
+
+
+def _to_us(raw_ts: int) -> int:
+    """Microseconds since epoch: `raw_ts` is already µs if >= MICROS_THRESHOLD, else ms."""
+    return raw_ts if raw_ts >= MICROS_THRESHOLD else raw_ts * 1000
+
+
+def _num(field: str, line: int, name: str) -> float:
+    try:
+        return float(field)
+    except ValueError as exc:
+        raise ArchiveError(f"line {line}: bad {name} {field!r}") from exc
+
+
+def _integer(field: str, line: int, name: str) -> int:
+    try:
+        return int(field)
+    except ValueError as exc:
+        raise ArchiveError(f"line {line}: bad {name} {field!r}") from exc
+
+
+def _ts_series(values: list[int]) -> pl.Series:
+    return pl.Series("ts", values, dtype=pl.Int64).cast(pl.Datetime("us")).dt.replace_time_zone("UTC")
+
+
+def parse_klines_csv(raw: bytes) -> pl.DataFrame:
+    """Parse a Binance kline CSV (header optional) into KLINE_SCHEMA, sorted by ts.
+
+    Duplicate timestamps are kept; validation reports them.
+    """
+    rows = _rows(raw)
+    if rows and not _is_int(rows[0][1][0].strip()):
+        rows = rows[1:]
+    ts: list[int] = []
+    cols: dict[str, list[float]] = {k: [] for k in ("open", "high", "low", "close", "volume", "quote_volume")}
+    trades: list[int] = []
+    for line, f in rows:
+        if len(f) != _KLINE_COLUMNS:
+            raise ArchiveError(f"line {line}: expected {_KLINE_COLUMNS} columns, got {len(f)}")
+        ts.append(_to_us(_integer(f[0].strip(), line, "open_time")))
+        cols["open"].append(_num(f[1], line, "open"))
+        cols["high"].append(_num(f[2], line, "high"))
+        cols["low"].append(_num(f[3], line, "low"))
+        cols["close"].append(_num(f[4], line, "close"))
+        cols["volume"].append(_num(f[5], line, "volume"))
+        cols["quote_volume"].append(_num(f[7], line, "quote_volume"))
+        trades.append(_integer(f[8].strip(), line, "count"))
+    df = pl.DataFrame(
+        {"ts": _ts_series(ts), **cols, "trades": pl.Series("trades", trades, dtype=pl.Int64)}
+    )
+    return df.sort("ts", maintain_order=True).cast(pl.Schema(dict(KLINE_SCHEMA)))
+
+
+def parse_funding_csv(raw: bytes) -> pl.DataFrame:
+    """Parse a Binance fundingRate CSV (header optional) into FUNDING_SCHEMA, sorted by ts.
+
+    `mark_price` is always null: the archive does not carry it.
+    """
+    rows = _rows(raw)
+    t_idx, r_idx, width = 0, 2, len(_FUNDING_HEADER)
+    if rows and not _is_int(rows[0][1][0].strip()):
+        header = [h.strip() for h in rows[0][1]]
+        missing = [h for h in ("calc_time", "last_funding_rate") if h not in header]
+        if missing:
+            raise ArchiveError(f"line {rows[0][0]}: funding header lacks {missing}")
+        t_idx, r_idx, width = header.index("calc_time"), header.index("last_funding_rate"), len(header)
+        rows = rows[1:]
+    ts: list[int] = []
+    rates: list[float] = []
+    for line, f in rows:
+        if len(f) != width:
+            raise ArchiveError(f"line {line}: expected {width} columns, got {len(f)}")
+        ts.append(_to_us(_integer(f[t_idx].strip(), line, "calc_time")))
+        rates.append(_num(f[r_idx], line, "last_funding_rate"))
+    df = pl.DataFrame(
+        {
+            "ts": _ts_series(ts),
+            "rate": pl.Series("rate", rates, dtype=pl.Float64),
+            "mark_price": pl.Series("mark_price", [None] * len(ts), dtype=pl.Float64),
+        }
+    )
+    return df.sort("ts", maintain_order=True).cast(pl.Schema(dict(FUNDING_SCHEMA)))

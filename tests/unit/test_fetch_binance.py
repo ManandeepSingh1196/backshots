@@ -1,9 +1,10 @@
 from __future__ import annotations
 
-from datetime import date
+from datetime import UTC, date, datetime
 from pathlib import Path
 
 import httpx
+import polars as pl
 import pytest
 
 from bt.core.errors import ArchiveError, ChecksumMismatchError, DataError
@@ -13,7 +14,10 @@ from bt.data.fetch_binance import (
     download_archive,
     funding_archive_files,
     kline_archive_files,
+    parse_funding_csv,
+    parse_klines_csv,
 )
+from bt.data.validate import FUNDING_SCHEMA, KLINE_SCHEMA
 from tests.support.binance_archive import (
     ArchiveServer,
     build_checksum,
@@ -303,3 +307,131 @@ def test_zip_with_no_csv_member_raises(tmp_path: Path) -> None:
 def test_corrupt_zip_raises(tmp_path: Path) -> None:
     with pytest.raises(ArchiveError, match="corrupt zip"):
         _download_zip(tmp_path, b"this is not a zip")
+
+
+# --- kline parsing ---------------------------------------------------------------------
+
+ROW_MS = (
+    "1704067200000,42283.58,44184.10,42180.77,44179.55,27174.29903,"
+    "1704153599999,1162870513.34,1043852,13517.74,578460929.45,0"
+)
+ROW_US = ROW_MS.replace("1704067200000", "1735689600000000", 1)
+HEADER = (
+    "open_time,open,high,low,close,volume,close_time,quote_volume,count,"
+    "taker_buy_volume,taker_buy_quote_volume,ignore"
+)
+
+
+def _row_ts(day: int) -> str:
+    return f"{1704067200000 + day * 86_400_000}" + ROW_MS[len("1704067200000") :]
+
+
+def test_headerless_kline_row() -> None:
+    df = parse_klines_csv((ROW_MS + "\n").encode())
+    assert df.height == 1
+    row = df.row(0, named=True)
+    assert row["ts"] == datetime(2024, 1, 1, tzinfo=UTC)
+    assert row["open"] == pytest.approx(42283.58, abs=1e-9)
+    assert row["high"] == pytest.approx(44184.10, abs=1e-9)
+    assert row["low"] == pytest.approx(42180.77, abs=1e-9)
+    assert row["close"] == pytest.approx(44179.55, abs=1e-9)
+    assert row["volume"] == pytest.approx(27174.29903, abs=1e-9)
+    assert row["quote_volume"] == pytest.approx(1162870513.34, abs=1e-9)
+    assert row["trades"] == 1043852
+    assert df.schema == pl.Schema(dict(KLINE_SCHEMA))
+
+
+def test_microsecond_row_and_mixed_file() -> None:
+    us = parse_klines_csv(ROW_US.encode())
+    assert us["ts"][0] == datetime(2025, 1, 1, tzinfo=UTC)
+    mixed = parse_klines_csv(f"{ROW_MS}\n{ROW_US}\n".encode())
+    assert mixed["ts"].to_list() == [
+        datetime(2024, 1, 1, tzinfo=UTC),
+        datetime(2025, 1, 1, tzinfo=UTC),
+    ]
+
+
+def test_threshold_boundary() -> None:
+    just_below = ROW_MS.replace("1704067200000", str(10**14 - 1), 1)
+    at = ROW_MS.replace("1704067200000", str(10**14), 1)
+    ts = parse_klines_csv(f"{just_below}\n{at}".encode())["ts"].dt.epoch("us").to_list()
+    assert ts == [10**14, (10**14 - 1) * 1000]  # sorted by ts; ms value scaled to us
+
+
+def test_header_row_gives_identical_output() -> None:
+    body = f"{ROW_MS}\n{ROW_US}\n"
+    assert parse_klines_csv(f"{HEADER}\n{body}".encode()).equals(parse_klines_csv(body.encode()))
+
+
+def test_kline_rows_sorted_and_duplicates_kept() -> None:
+    raw = f"{_row_ts(2)}\n{_row_ts(0)}\n{_row_ts(1)}\n{_row_ts(1)}\n".encode()
+    df = parse_klines_csv(raw)
+    assert df.height == 4
+    days = [t.day for t in df["ts"].to_list()]
+    assert days == [1, 2, 2, 3]
+    assert df.schema == pl.Schema(dict(KLINE_SCHEMA))
+
+
+def test_empty_klines() -> None:
+    for raw in (b"", HEADER.encode() + b"\n"):
+        df = parse_klines_csv(raw)
+        assert df.height == 0
+        assert df.schema == pl.Schema(dict(KLINE_SCHEMA))
+
+
+def test_short_row_mentions_line_number() -> None:
+    short = ",".join(ROW_MS.split(",")[:11])
+    with pytest.raises(ArchiveError, match="line 2"):
+        parse_klines_csv(f"{ROW_MS}\n{short}\n".encode())
+
+
+def test_unparseable_number_mentions_line_number() -> None:
+    bad = ROW_MS.replace("42283.58", "abc", 1)
+    with pytest.raises(ArchiveError, match="line 3"):
+        parse_klines_csv(f"{HEADER}\n{ROW_MS}\n{bad}\n".encode())
+
+
+# --- funding parsing -------------------------------------------------------------------
+
+FUND_HEADER = "calc_time,funding_interval_hours,last_funding_rate"
+FUND_ROW = "1704067200000,8,0.00010000"
+
+
+def test_funding_with_and_without_header() -> None:
+    with_header = parse_funding_csv(f"{FUND_HEADER}\n{FUND_ROW}\n".encode())
+    headerless = parse_funding_csv(f"{FUND_ROW}\n".encode())
+    for df in (with_header, headerless):
+        row = df.row(0, named=True)
+        assert row["ts"] == datetime(2024, 1, 1, tzinfo=UTC)
+        assert row["rate"] == pytest.approx(0.0001, abs=1e-12)
+        assert row["mark_price"] is None
+        assert df.schema == pl.Schema(dict(FUNDING_SCHEMA))
+    assert with_header.equals(headerless)
+
+
+def test_funding_header_locates_columns_by_name() -> None:
+    raw = "last_funding_rate,calc_time\n0.0002,1704096000000\n"
+    df = parse_funding_csv(raw.encode())
+    assert df["rate"].to_list() == [pytest.approx(0.0002, abs=1e-12)]
+    assert df["ts"][0] == datetime(2024, 1, 1, 8, tzinfo=UTC)
+
+
+def test_funding_sorted_micros_and_empty() -> None:
+    raw = "1735718400000000,8,0.0002\n1704067200000,8,0.0001\n"
+    df = parse_funding_csv(raw.encode())
+    assert df["ts"].to_list() == [
+        datetime(2024, 1, 1, tzinfo=UTC),
+        datetime(2025, 1, 1, 8, tzinfo=UTC),
+    ]
+    empty = parse_funding_csv(FUND_HEADER.encode())
+    assert empty.height == 0
+    assert empty.schema == pl.Schema(dict(FUNDING_SCHEMA))
+
+
+def test_funding_bad_rows_raise() -> None:
+    with pytest.raises(ArchiveError, match="line 2"):
+        parse_funding_csv(f"{FUND_ROW}\n1704067200000,8\n".encode())
+    with pytest.raises(ArchiveError, match="line 1"):
+        parse_funding_csv(b"1704067200000,8,oops\n")
+    with pytest.raises(ArchiveError, match="header"):
+        parse_funding_csv(b"a,b,c\n1,2,3\n")
