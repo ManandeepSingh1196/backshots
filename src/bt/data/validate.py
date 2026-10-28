@@ -48,7 +48,7 @@ _US: Final[timedelta] = timedelta(microseconds=1)
 
 @dataclass(frozen=True, slots=True)
 class Gap:
-    """Missing stretch between two present timestamps; `missing` is a positive-or-zero count."""
+    """Missing stretch between two present timestamps; `missing >= 1`."""
 
     after_ts: datetime
     before_ts: datetime
@@ -111,6 +111,14 @@ def _rule(df: pl.DataFrame, cond: pl.Expr, message: str) -> list[str]:
     if n == 0 or first is None:
         return []
     return [f"{message}: {n} rows, first {first.isoformat()}"]
+
+
+def _finite_errors(df: pl.DataFrame, columns: list[str]) -> list[str]:
+    """Errors for NaN/inf in float columns (nulls are not non-finite)."""
+    errors: list[str] = []
+    for col in columns:
+        errors += _rule(df, ~pl.col(col).is_finite(), f"non-finite {col}")
+    return errors
 
 
 def _null_errors(df: pl.DataFrame, columns: list[str]) -> list[str]:
@@ -182,6 +190,8 @@ def validate_klines(df: pl.DataFrame, timeframe: Timeframe, dataset: str) -> Val
             f"ts off {timeframe} grid",
         )
 
+    floats = ["open", "high", "low", "close", "volume", "quote_volume"]
+    errors += _finite_errors(df, floats)
     o, h, lo, c = (pl.col(n) for n in ("open", "high", "low", "close"))
     for name in ("open", "high", "low", "close"):
         errors += _rule(df, pl.col(name) <= 0, f"non-positive {name}")
@@ -193,14 +203,16 @@ def validate_klines(df: pl.DataFrame, timeframe: Timeframe, dataset: str) -> Val
 
     gaps: list[Gap] = []
     flags = _flags(df, pl.col("volume") == 0, "zero_volume")
-    flags += _flags(df, (h - lo) / lo > _RANGE_LIMIT, "wide_range")
+    flags += _flags(df, ((h - lo) / lo > _RANGE_LIMIT) & h.is_finite() & lo.is_finite(), "wide_range"
+    )
     if ordered:
         d = _diffs(df).filter(pl.col("d_us") > delta_us)
         gaps = [
             Gap(a, b, d_us // delta_us - 1)
             for a, b, d_us in d.iter_rows()
         ]
-        flags += _flags(df, (c / c.shift(1) - 1).abs() > _JUMP_LIMIT, "jump")
+        jump = (c / c.shift(1) - 1).abs() > _JUMP_LIMIT
+        flags += _flags(df, jump & c.is_finite() & c.shift(1).is_finite(), "jump")
     return ValidationReport(
         dataset, df.height, first_ts, last_ts, tuple(errors), tuple(gaps), _sorted_flags(flags)
     )
@@ -220,6 +232,7 @@ def validate_funding(df: pl.DataFrame, dataset: str) -> ValidationReport:
     if df["ts"].null_count() == 0:
         order_errors, ordered = _order_errors(df)
         errors += order_errors
+    errors += _finite_errors(df, ["rate", "mark_price"])
     errors += _rule(df, pl.col("mark_price") <= 0, "non-positive mark_price")
 
     interval_us = FUNDING_INTERVAL // _US
@@ -228,7 +241,9 @@ def validate_funding(df: pl.DataFrame, dataset: str) -> ValidationReport:
     if ordered:
         d = _diffs(df).filter(pl.col("d_us") > limit_us)
         gaps = [Gap(a, b, max(1, round(d_us / interval_us) - 1)) for a, b, d_us in d.iter_rows()]
-    flags = _flags(df, pl.col("rate").abs() > _EXTREME_RATE, "extreme_rate")
+    flags = _flags(
+        df, (pl.col("rate").abs() > _EXTREME_RATE) & pl.col("rate").is_finite(), "extreme_rate"
+    )
     return ValidationReport(
         dataset, df.height, first_ts, last_ts, tuple(errors), tuple(gaps), _sorted_flags(flags)
     )
