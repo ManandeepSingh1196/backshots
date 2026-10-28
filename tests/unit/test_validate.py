@@ -180,6 +180,7 @@ def test_zero_volume_flag_sorted() -> None:
     assert r.flags == (
         BarFlag(D(0), "wide_range"),
         BarFlag(D(0), "zero_volume"),
+        BarFlag(D(1), "wide_range"),
         BarFlag(D(1), "zero_volume"),
     )
 
