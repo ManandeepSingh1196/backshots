@@ -101,12 +101,13 @@ def test_single_row() -> None:
     assert s.max_drawdown_days == 0.0
 
 
-def test_all_up_curve() -> None:
-    # Sortino is exactly NaN (no negative return). Returns 0.1 and 0.1 differ by float error
-    # only, so Sharpe is either NaN or astronomically large; accept both.
-    s = curve_stats(days(3), [100, 110, 121], "1d")
+@pytest.mark.parametrize("g", [1.1, 1.01, 1.003, 1.07])
+def test_constant_growth_has_zero_spread(g: float) -> None:
+    # Constant-growth returns differ only by float noise; treated as zero spread.
+    s = curve_stats(days(30), [100.0 * g**i for i in range(30)], "1d")
+    assert math.isnan(s.sharpe)
+    assert s.vol_annual == 0.0
     assert math.isnan(s.sortino)
-    assert math.isnan(s.sharpe) or s.sharpe > 1e6
 
 
 def test_invalid_inputs() -> None:

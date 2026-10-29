@@ -26,6 +26,8 @@ BENCHMARK_KEYS: Final[tuple[str, ...]] = (
     "benchmark_correlation",
 )
 
+# Spread at or below this fraction of |mean return| is float noise, i.e. a constant return.
+_ZERO_SPREAD_REL_TOL: Final = 1e-12
 _NAN: Final = float("nan")
 _DAY: Final = timedelta(days=1)
 _DAYS_PER_YEAR: Final = 365.0
@@ -137,11 +139,15 @@ def curve_stats(
     vol = sharpe = sortino = _NAN
     if len(r) >= 2:
         sd = _std(r)
+        if sd <= _ZERO_SPREAD_REL_TOL * max(abs(_mean(r)), 1e-300):
+            sd = 0.0
         vol = sd * math.sqrt(p)
         if sd != 0:
             sharpe = _mean(r) / sd * math.sqrt(p)
     if r:
         downside = math.sqrt(math.fsum(min(v, 0.0) ** 2 for v in r) / len(r))
+        if downside <= _ZERO_SPREAD_REL_TOL * max(abs(_mean(r)), 1e-300):
+            downside = 0.0
         if downside != 0:
             sortino = _mean(r) / downside * math.sqrt(p)
 
@@ -185,6 +191,7 @@ def _trade_stats(result: EngineResult) -> tuple[int, int, list[float]]:
             avg[f.symbol] = (q * avg.get(f.symbol, 0.0) + f.qty * f.price) / (q + f.qty)
             qty[f.symbol] = q + f.qty
         else:
+            # A SELL with no prior position (avg=0) cannot happen on spot.
             pnls.append((f.price - avg.get(f.symbol, 0.0)) * f.qty)
             qty[f.symbol] = max(q - f.qty, 0.0)
     return n_buys, len(pnls), pnls
@@ -236,6 +243,7 @@ def compute_metrics(
     m["traded_notional_usdt"] = float(notional)
     m["turnover_annual"] = float(notional / _mean(after) / years) if years > 0 else _NAN
     m["exposure_time"] = float(sum(s.gross_exposure > EXPOSURE_ABS_TOL for s in snaps) / n)
+    # Leverage is undefined at equity <= 0, so those rows are skipped.
     lev = [s.gross_exposure / s.equity for s in snaps if s.equity > 0]
     m["avg_gross_leverage"] = float(_mean(lev)) if lev else _NAN
 
