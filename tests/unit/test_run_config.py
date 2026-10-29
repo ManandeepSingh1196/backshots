@@ -16,12 +16,12 @@ from bt.runs.config import (
     parse_override,
     resolve_config,
 )
+from bt.strategy import registry
 from bt.strategy.base import Intent, NoAction, Strategy
 from bt.strategy.context import Context
 from bt.strategy.registry import register
 
 
-@register("cfgtest")
 class CfgTest(Strategy):
     class Params(BaseModel):
         a: int = 1
@@ -31,13 +31,19 @@ class CfgTest(Strategy):
         return NoAction()
 
 
-@register("cfgnull")
 class CfgNull(Strategy):
     class Params(BaseModel):
         x: int | None = None
 
     def on_bar(self, ctx: Context) -> Intent:
         return NoAction()
+
+
+@pytest.fixture(autouse=True)
+def _cfg_strategies_registered(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(registry, "_REGISTRY", dict(registry._REGISTRY))  # pyright: ignore[reportPrivateUsage]
+    register("cfgtest")(CfgTest)
+    register("cfgnull")(CfgNull)
 
 
 MINIMAL = """
