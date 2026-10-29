@@ -212,5 +212,5 @@ def meta_from_json(text: str) -> RunMeta:
             killed_at=_opt_dt(d["killed_at"], "killed_at"),
             liquidated=_bool(d["liquidated"], "liquidated"),
         )
-    except (KeyError, TypeError, ValueError, BtError) as exc:
+    except (KeyError, TypeError, ValueError, RecursionError, BtError) as exc:
         raise RunError(f"cannot parse meta.json: {exc!r}") from exc
