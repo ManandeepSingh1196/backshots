@@ -9,11 +9,12 @@ from pathlib import Path
 
 import pytest
 
-import tests.support.buy_once  # noqa: F401  (registers "test_buy_once")
 from bt.engine.backtest import run_backtest
 from bt.runs.config import RunConfig, resolve_config
 from bt.runs.reader import read_run
 from bt.runs.writer import RUN_FILES
+from bt.strategy.registry import get_strategy
+from tests.support.buy_once import BuyOnce
 from tests.support.make_golden_fixture import FIXTURE_DIR, day
 
 EQUITY = [1000.0, 1028.97949, 1038.97949, 1048.97949, 1057.84006]
@@ -133,3 +134,7 @@ def test_report(run_dir: Path) -> None:
     assert "WARNING: BBBUSDT has 1 missing bar(s)" in text
     assert "Survivorship bias" in text
     assert "₹91.79" in text
+
+
+def test_strategy_registered() -> None:
+    assert get_strategy("test_buy_once") is BuyOnce
