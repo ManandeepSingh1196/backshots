@@ -5,7 +5,7 @@ from datetime import datetime
 
 import numpy as np
 import pytest
-from hypothesis import given, settings
+from hypothesis import event, given, settings
 from hypothesis import strategies as st
 
 from bt.core.events import EventLog
@@ -30,8 +30,9 @@ order_st = st.tuples(
     st.integers(0, 29),  # step index (mod the number of steps)
     st.sampled_from(SYMS),
     st.sampled_from([Side.BUY, Side.SELL]),
-    st.sampled_from([OrderType.MARKET, OrderType.LIMIT, OrderType.STOP]),
-    st.floats(0.0, 1.0),  # qty fraction of the grid
+    st.sampled_from([OrderType.MARKET] * 3 + [OrderType.LIMIT, OrderType.STOP]),
+    st.one_of(st.floats(0.0, 0.2), st.floats(0.0, 0.2), st.floats(0.0, 0.2), st.floats(0.0, 1.0)),
+    # qty fraction of the grid, biased small so more orders pass validation and fill
     st.floats(-0.2, 0.2),  # price offset from the previous close
 )
 
@@ -86,10 +87,18 @@ def make_bars(sc: Scenario) -> list[Bar]:
 def make_script(sc: Scenario, bars: list[Bar]) -> dict[datetime, list[Order]]:
     steps = sorted({b.ts for b in bars})
     script: dict[datetime, list[Order]] = {}
-    for k, (idx, sym, side, typ, frac, off) in enumerate(sc.orders):
+    bought = {sym: 0.0 for sym in SYMS}  # cumulative qty bought earlier in the script
+    ordered = sorted(enumerate(sc.orders), key=lambda e: e[1][0] % len(steps))
+    for k, (idx, sym, side, typ, frac, off) in ordered:
         ts = steps[idx % len(steps)]
         closes = [b.close for b in bars if b.symbol == sym and b.ts <= ts]
         qty = round(max(1, round(frac * MAX_UNITS[sym])) * STEP[sym], 3)
+        if side == Side.SELL and bought[sym] == 0:
+            side = Side.BUY  # nothing held yet: buy instead of selling into a rejection
+        if side == Side.SELL:
+            qty = max(STEP[sym], min(qty, round(bought[sym], 3)))  # size sells from holdings
+        else:
+            bought[sym] += qty
         ref = closes[-1]
         px = max(0.01, round(ref * (1 + off), 2))
         if typ == OrderType.LIMIT:
@@ -123,12 +132,22 @@ def notional(fills: tuple[Fill, ...]) -> float:
     return sum(f.qty * f.price for f in fills)
 
 
+def label_run(res: EngineResult) -> None:
+    n = len(res.fills)
+    event("fills=0" if n == 0 else "fills=1-3" if n <= 3 else "fills>=4")
+    if res.killed_at is not None:
+        event("killed")
+    if any(r.status == OrderStatus.REJECTED for r in res.orders):
+        event("rejected>0")
+
+
 @SETTINGS
 @given(scenario_st())
 def test_engine_invariants(sc: Scenario) -> None:
     bars = make_bars(sc)
     res = execute(sc, bars, make_script(sc, bars))  # (1) never raises
     steps = sorted({b.ts for b in bars})
+    label_run(res)
 
     for row in res.equity:  # (2)
         assert row.equity == pytest.approx(row.cash + row.net_exposure, abs=tol(row.equity))
@@ -168,6 +187,22 @@ def test_engine_invariants(sc: Scenario) -> None:
     assert all(s in terminal for s in last_status.values())
     assert res.final_positions == ()
     assert last.equity == pytest.approx(last.cash, abs=tol(last.equity))
+
+
+def test_generator_fills_often() -> None:
+    seen = [0, 0]  # [examples, examples with at least one fill]
+
+    @settings(derandomize=True, max_examples=100, database=None, deadline=None)
+    @given(scenario_st())
+    def probe(sc: Scenario) -> None:
+        bars = make_bars(sc)
+        res = execute(sc, bars, make_script(sc, bars))
+        seen[0] += 1
+        seen[1] += bool(res.fills)
+
+    probe()
+    assert seen[0] >= 50
+    assert seen[1] / seen[0] >= 0.60, seen
 
 
 @SETTINGS
