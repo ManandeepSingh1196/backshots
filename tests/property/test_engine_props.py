@@ -1,7 +1,12 @@
 """Hypothesis accounting invariants for run_engine on random spot scenarios (T020)."""
 
+import importlib.util
+import os
+import subprocess
+import sys
 from dataclasses import dataclass, replace
 from datetime import datetime
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -24,6 +29,7 @@ STEP = {"AAAUSDT": 0.001, "BBBUSDT": 0.1}
 START_PRICE = {"AAAUSDT": 100.0, "BBBUSDT": 20.0}
 MAX_UNITS = {"AAAUSDT": 20000, "BBBUSDT": 200}  # qty <= 20 on the step grid
 CASH = 1000.0
+EXPECTED_FILLS = 95  # scenarios with >= 1 fill out of 100 (seed 20241028)
 SETTINGS = settings(derandomize=True, deadline=None, max_examples=100)
 
 order_st = st.tuples(
@@ -189,20 +195,99 @@ def test_engine_invariants(sc: Scenario) -> None:
     assert last.equity == pytest.approx(last.cash, abs=tol(last.equity))
 
 
-def test_generator_fills_often() -> None:
-    seen = [0, 0]  # [examples, examples with at least one fill]
+def _scenario_from(rng: np.random.Generator) -> Scenario:
+    """Pure numpy mirror of scenario_st's distributions (no Hypothesis, no constant harvesting)."""
+    n = int(rng.integers(5, 31))
+    inner = [(s, i) for s in SYMS for i in range(2, n)]
+    k = int(rng.integers(0, 9))
+    picks = rng.choice(len(inner), size=min(k, len(inner)), replace=False)
+    missing = tuple(sorted(inner[int(j)] for j in picks))
+    orders: list[tuple[int, str, Side, OrderType, float, float]] = []
+    types = [OrderType.MARKET] * 3 + [OrderType.LIMIT, OrderType.STOP]
+    for _ in range(int(rng.integers(0, 41))):
+        frac = float(rng.uniform(0.0, 1.0) if rng.integers(0, 4) == 3 else rng.uniform(0.0, 0.2))
+        orders.append(
+            (
+                int(rng.integers(0, 30)),
+                SYMS[int(rng.integers(0, 2))],
+                (Side.BUY, Side.SELL)[int(rng.integers(0, 2))],
+                types[int(rng.integers(0, len(types)))],
+                frac,
+                float(rng.uniform(-0.2, 0.2)),
+            )
+        )
+    return Scenario(
+        seed=int(rng.integers(0, 2**32)),
+        n_bars=n,
+        maker=float(rng.uniform(0.0, 0.002)),
+        taker=float(rng.uniform(0.0, 0.002)),
+        bps=float(rng.uniform(0.0, 50.0)),
+        kill=(None, 0.3)[int(rng.integers(0, 2))],
+        vol=(0.02, 0.15)[int(rng.integers(0, 2))],
+        missing=missing,
+        orders=tuple(orders),
+    )
 
-    @settings(derandomize=True, max_examples=100, database=None, deadline=None)
-    @given(scenario_st())
-    def probe(sc: Scenario) -> None:
+
+def _fill_count() -> int:
+    rng = np.random.default_rng(20241028)
+    count = 0
+    for _ in range(100):
+        sc = _scenario_from(rng)
         bars = make_bars(sc)
-        res = execute(sc, bars, make_script(sc, bars))
-        seen[0] += 1
-        seen[1] += bool(res.fills)
+        count += bool(execute(sc, bars, make_script(sc, bars)).fills)
+    return count
 
-    probe()
-    assert seen[0] >= 50
-    assert seen[1] / seen[0] >= 0.60, seen
+
+def test_generator_fills_often(tmp_path: Path) -> None:
+    before = _fill_count()
+    # A module full of float literals must not change a numpy-driven count.
+    dummy = tmp_path / "dummy_float_consts.py"
+    dummy.write_text("A = 0.30\nB = 0.04\nC = 0.01\nD = 0.123456\n")
+    spec = importlib.util.spec_from_file_location("dummy_float_consts", dummy)
+    assert spec is not None
+    assert spec.loader is not None
+    spec.loader.exec_module(importlib.util.module_from_spec(spec))
+    after = _fill_count()
+    assert after == before
+    assert before >= 60, before
+    assert before == EXPECTED_FILLS, before
+
+
+_SUBPROC = """
+import hashlib, pickle, sys
+{extra}
+import numpy as np
+from tests.property.test_engine_props import _scenario_from, execute, make_bars, make_script
+rng = np.random.default_rng(20241028)
+out = []
+for _ in range(5):
+    sc = _scenario_from(rng)
+    bars = make_bars(sc)
+    out.append(execute(sc, bars, make_script(sc, bars)))
+digest = hashlib.sha256(pickle.dumps(out)).hexdigest()
+sys.stdout.write(digest + " " + str(sum(bool(r.fills) for r in out)))
+"""
+
+
+def test_engine_output_independent_of_imported_modules(tmp_path: Path) -> None:
+    """Same scenarios, same engine bytes, whatever else the process imported."""
+    (tmp_path / "dummy_consts.py").write_text("A = 0.30\nB = 0.04\nC = 0.01\n")
+    root = Path(__file__).resolve().parents[2]
+    env = {**os.environ, "PYTHONPATH": f"{root}{os.pathsep}{tmp_path}"}
+
+    def run(extra: str) -> str:
+        code = _SUBPROC.format(extra=extra)
+        proc = subprocess.run(
+            [sys.executable, "-c", code], capture_output=True, text=True, cwd=root, env=env
+        )
+        assert proc.returncode == 0, proc.stderr
+        return proc.stdout
+
+    plain = run("")
+    extra = run("import json, decimal, fractions, statistics, dummy_consts")
+    assert plain == extra
+    assert int(plain.split()[1]) >= 1
 
 
 @SETTINGS
