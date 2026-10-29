@@ -105,7 +105,7 @@ def test_next_run_id_timezones(tmp_path: Path) -> None:
     local = datetime(2024, 3, 5, 19, 37, 59, tzinfo=ist)
     assert next_run_id(tmp_path, local, "test_buy_once", "abcd1234") == RID
     with pytest.raises(TimezoneError):
-        next_run_id(tmp_path, datetime(2024, 3, 5, 14, 7), "s", "abcd1234")
+        next_run_id(tmp_path, datetime(2024, 3, 5, 14, 7), "s", "abcd1234")  # noqa: DTZ001
 
 
 def test_metrics_to_json() -> None:
