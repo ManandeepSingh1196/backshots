@@ -516,6 +516,24 @@ def test_kill_cancels_strategy_limit_before_kill_sell() -> None:
     ]
     kill_fill = next(f for f in r.result.fills if f.order_id.startswith("bt-kill"))
     assert kill_fill.ts == d(4)
+    d3 = [(x.order.id, x.status, x.reason) for x in r.result.orders if x.ts == d(3)]
+    assert d3 == [
+        ("l1", OrderStatus.CANCELED, "kill_switch"),
+        ("bt-kill-AAAUSDT-202401030000", OrderStatus.NEW, ""),
+    ]
+    pos = {(x.order.id, x.status): i for i, x in enumerate(r.result.orders)}
+    assert pos["l1", OrderStatus.CANCELED] < pos["bt-kill-AAAUSDT-202401030000", OrderStatus.NEW]
+
+
+def test_at_fill_cash_rejection_after_gap_up() -> None:
+    bars = [flat(A, 1, 100), flat(A, 2, 110), flat(A, 3, 110)]
+    r = run(bars, {d(1): [buy("b1", qty=9.9)]})
+    assert records(r, "b1") == [
+        (d(1), OrderStatus.NEW, ""),
+        (d(2), OrderStatus.REJECTED, "insufficient_cash_at_fill"),
+    ]
+    assert r.result.fills == ()
+    assert [e.cash for e in r.result.equity] == pytest.approx([1000, 1000, 1000], abs=1e-9)
 
 
 def test_target_weights_message_has_ts() -> None:
