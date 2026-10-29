@@ -18,6 +18,7 @@ from bt.analytics.report import (
 from bt.runs.config import RunConfig
 from bt.runs.fingerprint import SymbolCoverage
 from bt.runs.meta import RunMeta
+from bt.strategy import registry
 from bt.strategy.base import Intent, NoAction, Strategy
 from bt.strategy.context import Context
 from bt.strategy.registry import register
@@ -25,13 +26,18 @@ from bt.strategy.registry import register
 D1 = datetime(2024, 1, 1, tzinfo=UTC)
 
 
-@register("rpttest")
 class RptTest(Strategy):
     class Params(BaseModel):
         a: int = 1
 
     def on_bar(self, ctx: Context) -> Intent:
         return NoAction()
+
+
+@pytest.fixture(autouse=True)
+def _rpttest_registered(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(registry, "_REGISTRY", dict(registry._REGISTRY))  # pyright: ignore[reportPrivateUsage]
+    register("rpttest")(RptTest)
 
 
 def make_config(end: str = "2024-01-05") -> RunConfig:
