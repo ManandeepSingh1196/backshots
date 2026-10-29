@@ -1,6 +1,9 @@
 """Hypothesis accounting invariants for run_engine on random spot scenarios (T020)."""
 
 import importlib.util
+import os
+import subprocess
+import sys
 from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
@@ -249,6 +252,42 @@ def test_generator_fills_often(tmp_path: Path) -> None:
     assert after == before
     assert before >= 60, before
     assert before == EXPECTED_FILLS, before
+
+
+_SUBPROC = """
+import hashlib, pickle, sys
+{extra}
+import numpy as np
+from tests.property.test_engine_props import _scenario_from, execute, make_bars, make_script
+rng = np.random.default_rng(20241028)
+out = []
+for _ in range(5):
+    sc = _scenario_from(rng)
+    bars = make_bars(sc)
+    out.append(execute(sc, bars, make_script(sc, bars)))
+digest = hashlib.sha256(pickle.dumps(out)).hexdigest()
+sys.stdout.write(digest + " " + str(sum(bool(r.fills) for r in out)))
+"""
+
+
+def test_engine_output_independent_of_imported_modules(tmp_path: Path) -> None:
+    """Same scenarios, same engine bytes, whatever else the process imported."""
+    (tmp_path / "dummy_consts.py").write_text("A = 0.30\nB = 0.04\nC = 0.01\n")
+    root = Path(__file__).resolve().parents[2]
+    env = {**os.environ, "PYTHONPATH": f"{root}{os.pathsep}{tmp_path}"}
+
+    def run(extra: str) -> str:
+        code = _SUBPROC.format(extra=extra)
+        proc = subprocess.run(
+            [sys.executable, "-c", code], capture_output=True, text=True, cwd=root, env=env
+        )
+        assert proc.returncode == 0, proc.stderr
+        return proc.stdout
+
+    plain = run("")
+    extra = run("import json, decimal, fractions, statistics, dummy_consts")
+    assert plain == extra
+    assert int(plain.split()[1]) >= 1
 
 
 @SETTINGS
