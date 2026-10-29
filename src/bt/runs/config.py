@@ -34,7 +34,10 @@ _BARE_KEY = re.compile(r"^[A-Za-z0-9_-]+$")
 def _number(v: object) -> float:
     if isinstance(v, bool) or not isinstance(v, int | float):
         raise ValueError(f"expected a number, got {v!r}")
-    f = float(v)
+    try:
+        f = float(v)
+    except OverflowError as exc:
+        raise ValueError("number out of range") from exc
     if not math.isfinite(f):
         raise ValueError("number must be finite")
     return f
@@ -275,7 +278,7 @@ def load_config(path: Path | None = None, overrides: Sequence[str] = ()) -> RunC
             text = path.read_text(encoding="utf-8")
         except FileNotFoundError as exc:
             raise ConfigError(f"config not found: {path}") from exc
-        except OSError as exc:
+        except (OSError, UnicodeDecodeError) as exc:
             raise ConfigError(f"cannot read config {path}: {exc}") from exc
         try:
             raw = tomllib.loads(text)

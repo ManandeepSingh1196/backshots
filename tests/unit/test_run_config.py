@@ -392,3 +392,15 @@ def test_immutable_and_pickle(tmp_path: Path) -> None:
 def test_errors_are_bt_errors() -> None:
     assert issubclass(ConfigError, BtError)
     assert issubclass(RunError, BtError)
+
+
+@pytest.mark.parametrize("key", ["run.initial_equity_inr", "costs.slippage.bps"])
+def test_huge_int_is_config_error(tmp_path: Path, key: str) -> None:
+    _bad(tmp_path, MINIMAL, [f"{key}=" + "9" * 400])
+
+
+def test_undecodable_file_is_config_error(tmp_path: Path) -> None:
+    p = tmp_path / "bad.toml"
+    p.write_bytes(b"\xff\xfe")
+    with pytest.raises(ConfigError):
+        load_config(p)
