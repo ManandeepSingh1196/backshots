@@ -47,3 +47,11 @@ class PortfolioError(BtError):
 
 class EngineError(BtError):
     """Inconsistent wiring: instrument sets differ, feed reused, or unsupported kind."""
+
+
+class ConfigError(BtError):
+    """Bad run config: TOML syntax, schema, override syntax, or unsupported option."""
+
+
+class RunError(BtError):
+    """A run directory cannot be written, read or found, or has the wrong schema."""
