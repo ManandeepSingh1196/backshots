@@ -133,6 +133,11 @@ def test_from_json_errors() -> None:
         meta_from_json(json.dumps({**obj, "liquidated": "yes"}))
 
 
+def test_from_json_deeply_nested_raises_run_error() -> None:
+    with pytest.raises(RunError):
+        meta_from_json("[" * 100_000 + "]" * 100_000)
+
+
 def test_pickle() -> None:
     m = make_meta()
     assert pickle.loads(pickle.dumps(m)) == m
