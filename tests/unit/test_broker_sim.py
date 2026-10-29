@@ -292,6 +292,29 @@ def test_settle_at_close() -> None:
         b.settle_at_close(_t(1), [order("s", Side.SELL)])
 
 
+def test_settle_at_close_sells_across_symbols_fill_in_input_order() -> None:
+    b, _ = mk(held={"AAAUSDT": 10.0, "BBBUSDT": 10.0})
+    b.process(step(1, "AAAUSDT", "BBBUSDT"))
+    fills = b.settle_at_close(
+        _t(1), [order("sb", Side.SELL, sym="BBBUSDT"), order("sa", Side.SELL, sym="AAAUSDT")]
+    )
+    assert [f.order_id for f in fills] == ["sb", "sa"]
+
+
+def test_settle_at_close_processes_sells_before_buys_regardless_of_input_order() -> None:
+    # Cash 50 cannot fund a buy at ~102.1 unless the sell proceeds (~101.9) are applied first.
+    b, log = mk(cash=50.0, held={"AAAUSDT": 10.0})
+    b.process(step(1, "AAAUSDT", "BBBUSDT"))
+    fills = b.settle_at_close(
+        _t(1), [order("buy", Side.BUY, sym="BBBUSDT"), order("sell", Side.SELL, sym="AAAUSDT")]
+    )
+    assert [f.order_id for f in fills] == ["sell", "buy"]
+    assert [(r.order.id, r.status) for r in log.orders()][:2] == [
+        ("buy", OrderStatus.NEW),
+        ("sell", OrderStatus.NEW),
+    ]  # NEW records keep input order; only settlement is sells-first
+
+
 @pytest.mark.parametrize("bad", [1.0, -0.1, float("nan")])
 def test_bad_slippage(bad: float) -> None:
     b = BrokerSim([AAA], VenueFees(), BadSlip(bad), FakeView(), EventLog())
