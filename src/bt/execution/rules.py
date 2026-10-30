@@ -1,11 +1,12 @@
 """Exchange order rules shared by backtest and live: rounding and order validation."""
 
 import math
-from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal, InvalidOperation
+from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal
 from typing import Final, get_args
 
-from bt.core.errors import ExecutionError
+from bt.core.errors import ExecutionError, InvariantError
 from bt.core.events import RejectReason
+from bt.core.rounding import floor_to_step
 from bt.core.types import (
     Instrument,
     InstrumentKind,
@@ -44,14 +45,10 @@ def round_qty_down(qty: float, inst: Instrument) -> float:
 
     May return less than min_qty; the caller decides what to do with that.
     """
-    if not math.isfinite(qty) or qty < 0:
-        raise ExecutionError(f"round_qty_down: qty must be finite and >= 0, got {qty!r}")
-    step = _dec(inst.qty_step)
     try:
-        k = _dec(qty) // step
-        return float(k * step)
-    except InvalidOperation as exc:
-        raise ExecutionError(f"round_qty_down: {qty!r} is too large for step {step}") from exc
+        return floor_to_step(qty, inst.qty_step)
+    except InvariantError as exc:
+        raise ExecutionError(f"round_qty_down: cannot floor {qty!r} to step: {exc}") from exc
 
 
 def round_price(price: float, inst: Instrument, side: Side) -> float:

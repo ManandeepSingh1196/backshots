@@ -195,3 +195,19 @@ def test_round_qty_down_properties(q: float, inst: Instrument) -> None:
     r = round_qty_down(q, inst)
     assert 0 <= q - r < inst.qty_step + 1e-9
     assert round_qty_down(r, inst) == r
+
+
+def test_round_qty_down_numpy_scalar() -> None:
+    import numpy as np
+
+    r = round_qty_down(np.float64(1.2345), AAA)  # pyright: ignore[reportArgumentType]
+    assert r == pytest.approx(1.234, abs=1e-12)
+    assert type(r) is float
+
+
+def test_round_qty_down_huge_chains_invariant_error() -> None:
+    from bt.core.errors import InvariantError
+
+    with pytest.raises(ExecutionError) as ei:
+        round_qty_down(1e300, _inst("HUGE", 1e-8, 1e-8))
+    assert isinstance(ei.value.__cause__, InvariantError)
