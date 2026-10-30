@@ -1,12 +1,14 @@
 """Strategy base class and the three intents a strategy may return."""
 
 import math
+import numbers
 from abc import ABC, abstractmethod
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from types import MappingProxyType
 from typing import ClassVar
 
+import numpy as np
 from pydantic import BaseModel, ConfigDict
 
 from bt.core.errors import StrategyError
@@ -32,27 +34,35 @@ class Orders:
         object.__setattr__(self, "orders", items)
 
 
+def _to_float(key: str, v: object) -> float:
+    if isinstance(v, bool | np.bool_) or not isinstance(v, numbers.Real | np.integer | np.floating):
+        raise StrategyError(f"TargetWeights: weight for {key!r} must be a real number, got {v!r}")
+    try:
+        f = float(v)  # pyright: ignore[reportUnknownArgumentType]
+    except OverflowError as e:
+        raise StrategyError(f"TargetWeights: weight for {key!r} overflows float, got {v!r}") from e
+    if not math.isfinite(f):
+        raise StrategyError(f"TargetWeights: weight for {key!r} must be finite, got {v!r}")
+    return f
+
+
 @dataclass(frozen=True, slots=True)
 class TargetWeights:
     """Desired signed fraction of equity per symbol; a missing symbol means 0.
 
     Invariants: `weights` is a read-only snapshot; every key is a non-empty str and every
-    value a finite int or float (never a bool). Not hashable, because it holds a Mapping.
+    value a finite Python float (ints and numpy reals are converted; bools are rejected).
+    Not hashable, because it holds a Mapping.
     """
 
     weights: Mapping[str, float]
 
     def __post_init__(self) -> None:
-        snap = dict(self.weights)
-        for k, v in snap.items():
+        snap: dict[str, float] = {}
+        for k, v in dict(self.weights).items():
             if not isinstance(k, str) or not k:  # pyright: ignore[reportUnnecessaryIsInstance]
                 raise StrategyError(f"TargetWeights: key must be a non-empty str, got {k!r}")
-            if (
-                isinstance(v, bool)
-                or not isinstance(v, int | float)  # pyright: ignore[reportUnnecessaryIsInstance]
-                or not math.isfinite(v)
-            ):
-                raise StrategyError(f"TargetWeights: weight for {k!r} must be finite, got {v!r}")
+            snap[k] = _to_float(k, v)
         object.__setattr__(self, "weights", MappingProxyType(snap))
 
     def __reduce__(self) -> tuple[type["TargetWeights"], tuple[dict[str, float]]]:
