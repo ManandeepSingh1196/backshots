@@ -18,6 +18,7 @@ REBALANCE_TAG: Final = "rebalance"
 
 
 def rebalance_order_id(symbol: str, ts: datetime) -> str:
+    """Deterministic id of a rebalance order: one per symbol per bar close (minute resolution)."""
     return f"bt-rb-{symbol}-{ts:%Y%m%d%H%M}"
 
 
@@ -36,7 +37,10 @@ def _real(x: object) -> float | None:
     """float(x) for a finite real non-bool number, else None."""
     if isinstance(x, bool) or not isinstance(x, numbers.Real):
         return None
-    f = float(x)
+    try:
+        f = float(x)
+    except OverflowError:
+        return None
     return f if math.isfinite(f) else None
 
 
@@ -118,7 +122,10 @@ def weights_to_orders(
         return [], []
     cash = float(ctx.cash)
 
-    gross = math.fsum(abs(v) for v in w_in.values())
+    try:
+        gross = math.fsum(abs(v) for v in w_in.values())
+    except OverflowError as exc:
+        raise StrategyError("weights_to_orders: sum of |weights| overflows") from exc
     if gross > max_gross_leverage:
         scale = max_gross_leverage / gross
         w_in = {s: v * scale for s, v in w_in.items()}

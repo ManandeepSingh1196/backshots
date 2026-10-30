@@ -333,3 +333,36 @@ def test_deterministic_and_ids() -> None:
     assert a == b
     assert rebalance_order_id("BTCUSDT", TS) == "bt-rb-BTCUSDT-202401020000"
     assert all(o.tag == "rebalance" for o in a[0])
+
+
+def test_gross_cap_counterexample_dust_stays() -> None:
+    """Cap 0.5: B buys to the capped target while sub-minimum dust in C stays (INTERFACES 15.5)."""
+    insts = {s: _inst(s) for s in "ABC"}
+    ctx = FakeCtx(
+        equity=10.001,
+        cash=10.0,
+        held={"C": 0.001},
+        refs={"A": 1.0, "B": 1.0, "C": 1.0},
+        insts=insts,
+    )
+    orders, skipped = run({"B": 1.0}, ctx, band=0.0, cap=0.5, buf=0.0)
+    check(orders, [("B", Side.BUY, 5.0)])
+    assert skipped == [SkippedOrder(TS, "C", Side.SELL, 0.001, 1.0, "below_min_notional")]
+
+
+def test_unknown_open_order_symbol() -> None:
+    with pytest.raises(EngineError):
+        run({"A": 0.5}, open_orders=[mkt(Side.BUY, "Z", 1.0)])
+
+
+@pytest.mark.parametrize("big", [10**400, -(10**400)])
+def test_overflowing_ints(big: int) -> None:
+    with pytest.raises(StrategyError):
+        run({"A": big})
+    with pytest.raises(EngineError):
+        run({"A": 0.5}, band=big)
+
+
+def test_gross_sum_overflow() -> None:
+    with pytest.raises(StrategyError):
+        run({"A": 1e308, "B": 1e308})

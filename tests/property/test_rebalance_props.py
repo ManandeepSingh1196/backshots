@@ -136,11 +136,15 @@ def test_rebalance_properties(
 
     before = sum(held[s] * refs[s] for s in SYMS)
     gross_after = sum(after[s] * refs[s] for s in SYMS)
-    # Ticket bound is max(cap * equity, before) * (1 + 1e-9). Positions left alone by the band
-    # or by the min-notional filter (each worth < band * equity or < min_notional) sit on top of
-    # the capped targets, so the bound needs that slack. See the T037 report.
-    slack = len(SYMS) * (band * ctx.equity + 5.0)
-    assert gross_after <= max(cap * ctx.equity + slack, before) * (1 + 1e-9)
+    # INTERFACES 15.5: with cap >= 1 the bound is exact. With cap < 1, positions the band or
+    # the min-notional filter leave alone can sit on top of the capped targets: at most one
+    # such position per symbol except the one holding the target, each worth less than
+    # max(band * equity, m), m = the largest minimum order value plus one qty step.
+    bound = max(cap * ctx.equity, before)
+    if cap < 1:
+        m = max(max(5.0, 0.002 * refs[s]) + STEP * refs[s] for s in SYMS)
+        bound = max(cap * ctx.equity + (len(SYMS) - 1) * max(band * ctx.equity, m), before)
+    assert gross_after <= bound * (1 + 1e-9)
 
 
 def test_order_type_is_plain() -> None:
