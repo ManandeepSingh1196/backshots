@@ -6,13 +6,21 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, time, timedelta
 from pathlib import Path
 
+import polars as pl
+
+from bt.analytics.benchmark import (
+    BENCHMARK_SYMBOL,
+    benchmark_metrics,
+    buy_hold_curve,
+)
 from bt.analytics.metrics import compute_metrics
 from bt.analytics.report import render_report
-from bt.core.errors import ConfigError, DataError, EngineError
+from bt.core.errors import ConfigError, DataError, EngineError, InvariantError
 from bt.core.events import EventLog
 from bt.core.types import Instrument
 from bt.data.catalog import Catalog
 from bt.data.feed import ParquetFeed
+from bt.data.validate import Timeframe
 from bt.engine.loop import EngineConfig, run_engine
 from bt.execution.broker_sim import BrokerSim
 from bt.execution.fees import VenueFees
@@ -52,6 +60,16 @@ def _select_instruments(catalog: Catalog, cfg: RunConfig) -> tuple[Instrument, .
     return tuple(sorted(selected, key=lambda i: i.symbol))
 
 
+def _benchmark_instrument(catalog: Catalog, tf: Timeframe) -> Instrument | None:
+    """BTCUSDT spot if it is in the snapshot and its klines file exists, else None."""
+    all_insts, _ = catalog.read_instruments()
+    for i in all_insts:
+        usable = i.kind.value == "spot" and i.venue_symbol == BENCHMARK_SYMBOL
+        if usable and catalog.klines_path("spot", tf, BENCHMARK_SYMBOL).is_file():
+            return i
+    return None
+
+
 def run_backtest(
     config: RunConfig, *, data_dir: Path = Path("data"), runs_dir: Path = Path("runs")
 ) -> RunResult:
@@ -74,7 +92,11 @@ def run_backtest(
     end = datetime.combine(cfg.run.end + timedelta(days=1), time(0), UTC)  # end is inclusive
     feed = ParquetFeed(catalog, insts, tf, start, end, warmup_bars=warmup)
 
-    fp = data_fingerprint(catalog, insts, market, tf)
+    bench = _benchmark_instrument(catalog, tf)
+    fp_insts = insts
+    if bench is not None and bench.symbol not in {i.symbol for i in insts}:
+        fp_insts = (*insts, bench)
+    fp = data_fingerprint(catalog, fp_insts, market, tf)
     hash8 = run_hash(cfg, fp)[:8]
     config_sha256 = hashlib.sha256(canonical_json(cfg.model_dump(mode="json")).encode()).hexdigest()
 
@@ -102,6 +124,31 @@ def run_backtest(
     result = run_engine(strategy, feed, broker, pf, log, ecfg)
 
     metrics = compute_metrics(result, tf, initial, cfg.run.inr_per_usdt)
+    equity = equity_frame(result, tf)
+    if bench is not None:
+        bars = catalog.read_klines("spot", tf, BENCHMARK_SYMBOL)
+        bars = bars.filter((pl.col("ts") >= start) & (pl.col("ts") < end))
+        if bars.height > 0:
+            try:
+                curve = buy_hold_curve(
+                    bars["open"].to_list(),
+                    bars["close"].to_list(),
+                    bench,
+                    initial,
+                    cfg.costs.slippage.bps / 10_000,
+                    cfg.run.close_at_end,
+                )
+                metrics.update(
+                    benchmark_metrics(
+                        equity["ts"].to_list(),
+                        equity["equity_after_tax"].to_list(),
+                        bars["ts"].to_list(),
+                        curve,
+                        tf,
+                    )
+                )
+            except InvariantError as exc:
+                raise DataError(f"benchmark {BENCHMARK_SYMBOL}: {exc}") from exc
     cov = window_coverage(catalog, insts, market, tf, start, end)
     metrics["missing_bars"] = float(sum(c.missing for c in cov))
 
@@ -123,7 +170,6 @@ def run_backtest(
         killed_at=result.killed_at,
         liquidated=result.liquidated,
     )
-    equity = equity_frame(result, tf)
     report = render_report(cfg, metrics, equity, meta)
     artifacts = RunArtifacts(
         config=cfg,
