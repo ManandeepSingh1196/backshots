@@ -1,0 +1,29 @@
+{
+  "files": {
+    "binance/spot/klines/1d/BTCUSDT.parquet": {
+      "checksums": {},
+      "first_ts": "2023-01-01T00:00:00+00:00",
+      "ingested_at": "2024-03-01T00:00:00+00:00",
+      "last_ts": "2024-02-04T00:00:00+00:00",
+      "path": "binance/spot/klines/1d/BTCUSDT.parquet",
+      "rows": 400,
+      "sha256": "e4c38956d743cc7f077bff5bf429ff25a0ade59a1b89b82eccfa9fda0a3c94c9",
+      "sources": [
+        "crosscheck"
+      ]
+    },
+    "binance/spot/klines/1d/ETHUSDT.parquet": {
+      "checksums": {},
+      "first_ts": "2023-01-01T00:00:00+00:00",
+      "ingested_at": "2024-03-01T00:00:00+00:00",
+      "last_ts": "2024-02-04T00:00:00+00:00",
+      "path": "binance/spot/klines/1d/ETHUSDT.parquet",
+      "rows": 400,
+      "sha256": "186b863e8c5da534470852b698bcde8b3f19f1cb5c25b6144c4df98b3430c6c8",
+      "sources": [
+        "crosscheck"
+      ]
+    }
+  },
+  "version": 1
+}
