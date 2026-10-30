@@ -11,6 +11,7 @@ from typer.testing import CliRunner
 import bt.cli.run as cli_run
 import bt.engine.backtest as bt_backtest
 from bt.cli.main import app
+from bt.core.errors import StrategyError
 from bt.runs.reader import read_run
 from bt.runs.writer import RUN_FILES
 from bt.strategy.registry import get_strategy
@@ -134,7 +135,7 @@ def test_overrides_and_positional_strategy(tmp_path: Path) -> None:
 def test_exit_2(extra: list[str], cfg_file: Path, tmp_path: Path) -> None:
     extra = [str(tmp_path / "missing.toml") if x == "MISSING" else x for x in extra]
     args = run_args(cfg_file, tmp_path)
-    if "--config" in extra:  # the later --config wins over the valid one
+    if "--config" in extra:  # drop the valid --config pair so the missing file is the only --config
         args = args[:1] + args[3:]
     res = runner.invoke(app, [*args, *extra])
     assert res.exit_code == 2, res.output
@@ -246,3 +247,28 @@ def test_help_lists_commands() -> None:
     assert res.exit_code == 0
     for name in ("data", "run", "show"):
         assert name in res.stdout
+
+
+def test_list_strategies() -> None:
+    res = runner.invoke(app, ["list", "strategies"])
+    assert res.exit_code == 0, res.output
+    lines = res.output.splitlines()
+    assert 'test_buy_once  {"buys":{},"warmup":0}' in lines
+    names = [ln.split("  ", 1)[0] for ln in lines]
+    assert names == sorted(names)
+
+
+def test_list_strategies_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    def boom() -> list[tuple[str, type]]:
+        raise StrategyError("boom")
+
+    monkeypatch.setattr(cli_run, "list_strategies", boom)
+    res = runner.invoke(app, ["list", "strategies"])
+    assert res.exit_code == 1
+    assert "boom" in res.output
+
+
+def test_list_no_subcommand() -> None:
+    res = runner.invoke(app, ["list"])
+    assert "strategies" in res.output
+    assert "Traceback" not in res.output

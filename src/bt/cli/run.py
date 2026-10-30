@@ -13,7 +13,9 @@ from bt.analytics.report import WARNING_PREFIX, render_report
 from bt.core.errors import BtError, ConfigError, RunError, StrategyError
 from bt.engine.backtest import run_backtest
 from bt.runs.config import RunConfig, load_config, resolve_config
+from bt.runs.fingerprint import canonical_json
 from bt.runs.reader import read_run, resolve_run_ref
+from bt.strategy.registry import list_strategies
 
 _EXIT_FAILED = 1
 _EXIT_USAGE = 2
@@ -104,3 +106,18 @@ def show_cmd(
     _print_report(console, text)
     if text != data.report:
         console.print("[yellow]report.txt differs from re-render (older code version?)[/yellow]")
+
+
+def list_strategies_cmd() -> None:
+    """List registered strategies with their default params."""
+    console = _console()
+    _ensure_strategies_importable(Path.cwd())
+    try:
+        entries = list_strategies()
+    except StrategyError as e:
+        raise _fail(console, e, _EXIT_FAILED) from e
+    for name, cls in sorted(entries, key=lambda e: e[0]):
+        params = canonical_json(cls.Params().model_dump(mode="json"))
+        console.print(
+            f"{name}  {params}", markup=False, highlight=False, emoji=False, soft_wrap=True
+        )

@@ -55,9 +55,13 @@ def _discover() -> None:
     try:
         pkg = importlib.import_module("strategies")
     except ImportError as exc:
-        raise StrategyError(
-            "cannot import the 'strategies' package; run from the repo root"
-        ) from exc
+        if exc.name == "strategies":
+            raise StrategyError(
+                "cannot import the 'strategies' package; run from the repo root"
+            ) from exc
+        raise StrategyError(f"failed to import the 'strategies' package: {exc!r}") from exc
+    except Exception as exc:
+        raise StrategyError(f"failed to import the 'strategies' package: {exc!r}") from exc
     names = sorted(m.name for m in pkgutil.iter_modules(pkg.__path__) if not m.name.startswith("_"))
     for mod in names:
         full = f"strategies.{mod}"

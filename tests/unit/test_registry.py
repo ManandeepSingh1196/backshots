@@ -159,3 +159,38 @@ def test_build_params() -> None:
 
 def test_instrument_import_unused() -> None:
     assert Instrument is not None
+
+
+def test_discovery_nested_missing_import(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _make_pkg(tmp_path, monkeypatch, {})
+    (tmp_path / "strategies" / "__init__.py").write_text("import nonexistent_xyz\n")
+    with pytest.raises(StrategyError, match="nonexistent_xyz") as ei:
+        list_strategies()
+    assert "repo root" not in str(ei.value)
+
+
+def test_discovery_init_runtime_error(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _make_pkg(tmp_path, monkeypatch, {})
+    (tmp_path / "strategies" / "__init__.py").write_text('raise RuntimeError("bad init")\n')
+    with pytest.raises(StrategyError, match="bad init") as ei:
+        list_strategies()
+    assert isinstance(ei.value.__cause__, RuntimeError)
+    assert "repo root" not in str(ei.value)
+
+
+def test_discovery_missing_package_mentions_repo_root(monkeypatch: pytest.MonkeyPatch) -> None:
+    for m in [m for m in sys.modules if m == "strategies" or m.startswith("strategies.")]:
+        monkeypatch.delitem(sys.modules, m, raising=False)
+    monkeypatch.setitem(sys.modules, "strategies", None)
+    with pytest.raises(StrategyError, match="repo root"):
+        list_strategies()
+
+
+def test_leak_check_helper() -> None:
+    from tests.conftest import leaked_strategies
+
+    main_cls = type("Stray", (), {"__module__": "__main__"})
+    real_cls = type("BuyHold", (), {"__module__": "strategies.buy_hold"})
+    assert leaked_strategies({"stray": main_cls}) == ["stray"]
+    assert leaked_strategies({"buy_hold": real_cls}) == []
+    assert leaked_strategies({"test_buy_once": main_cls}) == []

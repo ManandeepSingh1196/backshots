@@ -8,6 +8,7 @@ import os
 import shutil
 import subprocess
 import sys
+import tempfile
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -52,18 +53,10 @@ FIXED = datetime(2024, 3, 1, 12, 0, tzinfo=UTC)
 
 
 def config(buys: str = "5.0") -> RunConfig:
-    return load_config(None, [f"params.buys={{AAAUSDT={buys}}}", *_BASE])
-
-
-_BASE = [
-    "run.strategy=test_buy_once",
-    "run.start=2024-01-01",
-    "run.end=2024-01-05",
-    "run.initial_equity_inr=85000",
-    "run.inr_per_usdt=85",
-    'universe.symbols=["BBBUSDT", "AAAUSDT"]',
-    "costs.slippage.bps=10",
-]
+    with tempfile.TemporaryDirectory() as d:
+        path = Path(d) / "run.toml"
+        path.write_text(CONFIG.replace("AAAUSDT = 5.0", f"AAAUSDT = {buys}"))
+        return load_config(path)
 
 
 def go(runs: Path, cfg: RunConfig | None = None, data_dir: Path = FIXTURE_DIR) -> Path:
