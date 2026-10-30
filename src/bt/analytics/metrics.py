@@ -261,6 +261,6 @@ def compute_metrics(
     m["killed"] = 1.0 if result.killed_at else 0.0
     m["liquidated"] = float(result.liquidated)
 
-    for key in BENCHMARK_KEYS:  # M4: filled by analytics/benchmark.py via curve_stats
+    for key in BENCHMARK_KEYS:  # M4: run_backtest overwrites via analytics/benchmark.py
         m[key] = _NAN
     return m
