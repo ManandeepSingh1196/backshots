@@ -225,3 +225,118 @@ def test_no_network(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
 
     monkeypatch.setattr(socket, "socket", boom)
     run_backtest(cfg(), data_dir=FIXTURE_DIR, runs_dir=tmp_path)
+
+
+# ---- T033: BTC buy-and-hold benchmark ----
+
+BTC_OPEN = [100.0, 100.2, 108.0, 111.0, 113.0]
+BTC_CLOSE = [100.0, 108.0, 110.0, 112.0, 114.0]
+
+
+def _btc_catalog(
+    root: Path, *, close: Sequence[float] = BTC_CLOSE, days: Sequence[int] = (1, 2, 3, 4, 5)
+) -> None:
+    import polars as pl
+
+    from bt.core.types import InstrumentKind
+    from bt.data.catalog import Catalog
+    from bt.data.validate import KLINE_SCHEMA
+    from tests.support.make_golden_fixture import AAA, AAA_BARS, INGESTED_AT, day, frame
+
+    def btc_inst() -> Instrument:
+        return Instrument(
+            symbol="BTCUSDT",
+            venue_symbol="BTCUSDT",
+            kind=InstrumentKind.SPOT,
+            base="BTC",
+            quote="USDT",
+            min_qty=0.001,
+            qty_step=0.001,
+            min_notional=5.0,
+            price_tick=0.01,
+            maker_fee=0.001,
+            taker_fee=0.001,
+        )
+
+    cat = Catalog(root)
+    cat.write_klines("spot", "1d", "AAAUSDT", frame(AAA_BARS), ("t",), {}, INGESTED_AT)
+    if days:
+        n = len(days)
+        btc = pl.DataFrame(
+            {
+                "ts": [day(d) for d in days],
+                "open": [BTC_OPEN[d - 1] for d in days],
+                "high": [max(BTC_OPEN[d - 1], close[d - 1]) + 1 for d in days],
+                "low": [min(BTC_OPEN[d - 1], close[d - 1]) - 1 for d in days],
+                "close": [close[d - 1] for d in days],
+                "volume": [10.0] * n,
+                "quote_volume": [10.0 * close[d - 1] for d in days],
+                "trades": [1] * n,
+            },
+            schema=dict(KLINE_SCHEMA),
+        )
+        cat.write_klines("spot", "1d", "BTCUSDT", btc, ("t",), {}, INGESTED_AT)
+    cat.write_instruments([AAA, btc_inst()], INGESTED_AT)
+
+
+def test_benchmark_metrics_and_report(tmp_path: Path) -> None:
+    from bt.runs.reader import read_run
+
+    _btc_catalog(tmp_path / "d")
+    res = run_backtest(cfg(), data_dir=tmp_path / "d", runs_dir=tmp_path / "r")
+    assert res.metrics["benchmark_total_return"] == pytest.approx(0.132913841172, abs=TOL)
+    data = read_run(res.run_dir)
+    assert data.metrics["benchmark_total_return"] == pytest.approx(0.132913841172, abs=TOL)
+    row = next(ln for ln in data.report.splitlines() if ln.startswith("Total return"))
+    assert "13.29%" in row
+
+
+def test_benchmark_hash_covers_btc(tmp_path: Path) -> None:
+    from bt.runs.reader import read_run
+
+    _btc_catalog(tmp_path / "a")
+    _btc_catalog(tmp_path / "b", close=[100.0, 108.0, 110.0, 112.0, 115.0])
+    ha = read_run(run_backtest(cfg(), data_dir=tmp_path / "a", runs_dir=tmp_path / "r").run_dir)
+    hb = read_run(run_backtest(cfg(), data_dir=tmp_path / "b", runs_dir=tmp_path / "r").run_dir)
+    assert ha.meta.hash8 != hb.meta.hash8
+
+
+def test_benchmark_in_universe_fingerprinted_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _btc_catalog(tmp_path / "d")
+    seen: list[tuple[str, ...]] = []
+    real = bt_backtest.data_fingerprint
+
+    def spy_fp(catalog: object, insts: Sequence[Instrument], *a: object) -> object:
+        seen.append(tuple(i.symbol for i in insts))
+        return real(catalog, insts, *a)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(bt_backtest, "data_fingerprint", spy_fp)
+    run_backtest(cfg(), data_dir=tmp_path / "d", runs_dir=tmp_path / "r")
+    run_backtest(
+        cfg(symbols=("AAAUSDT", "BTCUSDT"), params={"buys": {"AAAUSDT": 5.0}}),
+        data_dir=tmp_path / "d",
+        runs_dir=tmp_path / "r",
+    )
+    assert seen == [("AAAUSDT", "BTCUSDT"), ("AAAUSDT", "BTCUSDT")]
+
+
+def test_benchmark_no_rows_in_window_is_nan(tmp_path: Path) -> None:
+    _btc_catalog(tmp_path / "d", days=(1, 2))  # BTC ends before the window starts
+    res = run_backtest(cfg(start="2024-01-03"), data_dir=tmp_path / "d", runs_dir=tmp_path / "r")
+    assert all(math.isnan(v) for k, v in res.metrics.items() if k.startswith("benchmark_"))
+
+
+def test_benchmark_missing_klines_is_nan(tmp_path: Path) -> None:
+    _btc_catalog(tmp_path / "d", days=())
+    res = run_backtest(cfg(), data_dir=tmp_path / "d", runs_dir=tmp_path / "r")
+    assert all(math.isnan(v) for k, v in res.metrics.items() if k.startswith("benchmark_"))
+
+
+def test_benchmark_deterministic(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(bt_backtest, "_utcnow", lambda: datetime(2024, 3, 1, 12, 30, 5, tzinfo=UTC))
+    _btc_catalog(tmp_path / "d")
+    a = run_backtest(cfg(), data_dir=tmp_path / "d", runs_dir=tmp_path / "r")
+    b = run_backtest(cfg(), data_dir=tmp_path / "d", runs_dir=tmp_path / "r")
+    assert (a.run_dir / "metrics.json").read_bytes() == (b.run_dir / "metrics.json").read_bytes()
