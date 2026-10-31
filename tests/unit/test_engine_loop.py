@@ -16,7 +16,8 @@ from bt.execution.broker_sim import BrokerSim
 from bt.execution.fees import VenueFees
 from bt.execution.slippage import FixedBps, SlippageModel
 from bt.portfolio.portfolio import Portfolio
-from bt.strategy.base import Intent, NoAction
+from bt.runs.frames import orders_frame
+from bt.strategy.base import Intent, NoAction, TargetWeights
 from bt.strategy.context import Context
 from tests.support.memory_feed import MemoryFeed
 from tests.support.scripted import ScriptedStrategy
@@ -545,3 +546,154 @@ def test_memory_feed_no_funding_on_spot() -> None:
     feed = MemoryFeed((AAA,), [flat(A, 1, 100), flat(A, 2, 100)], [FundingEvent(A, d(1), 0.0001)])
     assert [s.funding for s in feed.steps()] == [(), ()]
     assert feed.funding_history(A, d(5), 10) == ()
+
+
+# ---- TargetWeights path (T038) ----
+
+AAAr = inst("AAA", fee=0.001)
+BBBr = inst("BBB", fee=0.001)
+ROT_BARS = [flat(A, i, 100) for i in range(1, 5)] + [flat(B, i, 50) for i in range(1, 5)]
+ROT_ID_A = "bt-rb-AAAUSDT-202401010000"
+ROT_SELL = "bt-rb-AAAUSDT-202401020000"
+ROT_BUY = "bt-rb-BBBUSDT-202401020000"
+
+
+def weights_hook(
+    targets: Mapping[datetime, Mapping[str, float]],
+) -> Callable[[Context], Intent | None]:
+    return lambda ctx: TargetWeights(dict(targets[ctx.now])) if ctx.now in targets else None
+
+
+def rotation(**kw: object) -> Run:
+    return run(
+        ROT_BARS,
+        {},
+        insts=(AAAr, BBBr),
+        slip=FixedBps(5),
+        hook=weights_hook({d(1): {A: 1.0}, d(2): {B: 1.0}}),
+        **kw,  # type: ignore[arg-type]
+    )
+
+
+def test_rotation_sells_and_buys_in_one_bar() -> None:
+    r = rotation()
+    assert [f.order_id for f in r.result.fills[:1]] == [ROT_ID_A]
+    assert r.result.fills[0].qty == pytest.approx(9.935, abs=1e-9)
+    assert records(r, ROT_SELL)[0] == (d(2), OrderStatus.NEW, "")
+    assert records(r, ROT_BUY)[0] == (d(2), OrderStatus.NEW, "")
+    sell_o = next(x.order for x in r.result.orders if x.order.id == ROT_SELL)
+    buy_o = next(x.order for x in r.result.orders if x.order.id == ROT_BUY)
+    assert sell_o.qty == pytest.approx(9.935, abs=1e-9)
+    assert buy_o.qty == pytest.approx(19.712, abs=1e-9)
+    assert [f.order_id for f in r.result.fills[1:3]] == [ROT_SELL, ROT_BUY]
+    assert r.result.fills[1].ts == r.result.fills[2].ts == d(3)
+    assert r.result.fills[1].price == pytest.approx(99.95, abs=1e-9)
+    assert r.result.fills[2].price == pytest.approx(50.025, abs=1e-9)
+    closing = r.result.fills[3]
+    assert closing.price == pytest.approx(49.975, abs=1e-9)
+    want = [1000, 998.50925325, 995.5406072, 994.0627]
+    assert [e.equity for e in r.result.equity] == pytest.approx(want, abs=1e-6)
+
+
+def test_rotation_credit_is_required() -> None:
+    r = rotation()
+    # at d2 cash is only ~5.009253; the buy leg needs 19.712 * 50 * 1.001 = 986.5856
+    assert r.result.equity[1].cash == pytest.approx(5.009253, abs=1e-6)
+    assert pytest.approx(986.5856, abs=1e-6) == 19.712 * 50 * 1.001
+
+
+def test_orders_path_gets_no_credit() -> None:
+    script = {
+        d(1): [buy("x1", A, 9.935)],
+        d(2): [sell("x2", A, 9.935), buy("x3", B, 19.712)],
+    }
+    r = run(ROT_BARS, script, insts=(AAAr, BBBr), slip=FixedBps(5))
+    assert records(r, "x2")[0] == (d(2), OrderStatus.NEW, "")
+    assert records(r, "x3") == [(d(2), OrderStatus.REJECTED, "insufficient_cash")]
+
+
+def test_orders_with_rebalance_prefix_rejected() -> None:
+    r = run([flat(A, 1, 100), flat(A, 2, 100)], {d(1): [buy("bt-rb-AAAUSDT-202401010000")]})
+    assert records(r, "bt-rb-AAAUSDT-202401010000") == [
+        (d(1), OrderStatus.REJECTED, "duplicate_id")
+    ]
+
+
+def test_skipped_rows_logged() -> None:
+    bars = [flat(A, 1, 100), flat(A, 2, 100)]
+    r = run(
+        bars,
+        {},
+        config=EngineConfig(rebalance_band=0.0),
+        hook=weights_hook({d(1): {A: 0.004}}),
+    )
+    assert len(r.result.skipped) == 1
+    sk = r.result.skipped[0]
+    assert (sk.ts, sk.symbol, sk.reason) == (d(1), A, "below_min_notional")
+    assert r.result.orders == ()
+    row = orders_frame(r.result).row(0, named=True)
+    assert row["status"] == "skipped"
+    assert row["order_id"] is None
+    assert row["reason"] == "below_min_notional"
+
+
+@pytest.mark.parametrize("weights", [{"ZZZUSDT": 0.1}, {A: -0.1}])
+def test_bad_weights_raise_strategy_error(weights: dict[str, float]) -> None:
+    bars = [flat(A, 1, 100), flat(A, 2, 100)]
+    with pytest.raises(StrategyError):
+        run(bars, {}, hook=weights_hook({d(1): weights}), check=False)
+
+
+def test_unknown_symbol_error_names_it() -> None:
+    with pytest.raises(StrategyError, match="ZZZUSDT"):
+        run([flat(A, 1, 100)], {}, hook=weights_hook({d(1): {"ZZZUSDT": 0.1}}), check=False)
+
+
+def test_symbol_without_bar_yet_is_strategy_error() -> None:
+    bars = [flat(A, 1, 100), flat(A, 2, 100), flat(B, 2, 50)]
+    with pytest.raises(StrategyError, match="BBBUSDT"):
+        run(
+            bars,
+            {},
+            insts=(AAA, BBB),
+            hook=weights_hook({d(1): {B: 0.5}}),
+            check=False,
+        )
+
+
+def test_kill_cancels_pending_rebalance_order() -> None:
+    bars = [flat(A, 1, 100), oc(A, 2, 100, 40), flat(A, 3, 40), flat(A, 4, 40)]
+    bars += [flat(B, 1, 50), flat(B, 3, 50), flat(B, 4, 50)]  # no B bar on d2
+    r = run(
+        bars,
+        {},
+        insts=(AAA, BBB),
+        config=EngineConfig(max_drawdown_kill=0.25),
+        hook=weights_hook({d(1): {A: 0.5, B: 0.4}}),
+    )
+    assert r.result.killed_at == d(2)
+    rb = "bt-rb-BBBUSDT-202401010000"
+    assert records(r, rb) == [
+        (d(1), OrderStatus.NEW, ""),
+        (d(2), OrderStatus.CANCELED, "kill_switch"),
+    ]
+    d2 = [(x.order.id, x.status) for x in r.result.orders if x.ts == d(2)]
+    d2 = [x for x in d2 if x[1] != OrderStatus.FILLED]
+    assert d2[0] == (rb, OrderStatus.CANCELED)
+    assert d2[1] == ("bt-kill-AAAUSDT-202401020000", OrderStatus.NEW)
+
+
+def test_on_fill_fires_for_rebalance_fills() -> None:
+    r = rotation()
+    ids = [f.order_id for f in r.strategy.fills_seen]
+    assert ids[:3] == [ROT_ID_A, ROT_SELL, ROT_BUY]
+
+
+@pytest.mark.parametrize("bad", [-0.1, 1.0, float("nan"), float("inf"), True])
+def test_buy_buffer_validation(bad: float) -> None:
+    with pytest.raises(EngineError):
+        EngineConfig(buy_buffer=bad)
+
+
+def test_buy_buffer_default() -> None:
+    assert EngineConfig().buy_buffer == pytest.approx(0.0055, abs=1e-12)
