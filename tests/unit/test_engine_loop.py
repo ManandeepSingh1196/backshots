@@ -16,7 +16,7 @@ from bt.execution.broker_sim import BrokerSim
 from bt.execution.fees import VenueFees
 from bt.execution.slippage import FixedBps, SlippageModel
 from bt.portfolio.portfolio import Portfolio
-from bt.strategy.base import Intent, NoAction, TargetWeights
+from bt.strategy.base import Intent, NoAction
 from bt.strategy.context import Context
 from tests.support.memory_feed import MemoryFeed
 from tests.support.scripted import ScriptedStrategy
@@ -319,8 +319,6 @@ def test_warmup_and_on_start() -> None:
 
 def test_intent_errors() -> None:
     bars = [flat(A, 1, 100), flat(A, 2, 100)]
-    with pytest.raises(StrategyError, match="M5"):
-        run(bars, {}, hook=lambda ctx: TargetWeights({A: 0.5}), check=False)
 
     def boom(ctx: Context) -> Intent | None:
         raise RuntimeError("boom")
@@ -534,11 +532,6 @@ def test_at_fill_cash_rejection_after_gap_up() -> None:
     ]
     assert r.result.fills == ()
     assert [e.cash for e in r.result.equity] == pytest.approx([1000, 1000, 1000], abs=1e-9)
-
-
-def test_target_weights_message_has_ts() -> None:
-    with pytest.raises(StrategyError, match="2024-01-01"):
-        run([flat(A, 1, 100)], {}, hook=lambda ctx: TargetWeights({A: 0.5}), check=False)
 
 
 def test_kill_threshold_rejects_bool() -> None:
