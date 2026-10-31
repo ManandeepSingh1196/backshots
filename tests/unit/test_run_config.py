@@ -386,6 +386,7 @@ rebalance_band = 0.02
 order_ttl_bars = 3
 global_max_leverage = 2.0
 max_drawdown_kill = 0.4
+gap_buffer = 0.005
 """
 
 
