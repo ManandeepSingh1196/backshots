@@ -234,6 +234,11 @@ def _bad(tmp_path: Path, text: str, overrides: list[str] | None = None) -> None:
         ["engine.order_ttl_bars=2.5"],
         ["engine.global_max_leverage=0.5"],
         ["engine.rebalance_band=-0.1"],
+        ["engine.gap_buffer=-0.1"],
+        ["engine.gap_buffer=1.0"],
+        ["engine.gap_buffer=true"],
+        ["engine.gap_buffer=nan"],
+        ["engine.gap_buffer_x=0.1"],
         ["params.d=2024-01-01"],
         ["params.x=nan"],
         ["params.x=[1,inf]"],
@@ -410,3 +415,12 @@ def test_undecodable_file_is_config_error(tmp_path: Path) -> None:
     p.write_bytes(b"\xff\xfe")
     with pytest.raises(ConfigError):
         load_config(p)
+
+
+def test_gap_buffer_default_and_round_trip(tmp_path: Path) -> None:
+    c = _load(tmp_path, MINIMAL)
+    assert c.engine.gap_buffer == pytest.approx(0.005, abs=1e-12)
+    c2 = _load(tmp_path, MINIMAL, ["engine.gap_buffer=0.01"])
+    back = RunConfig.model_validate(tomllib.loads(config_to_toml(c2)))
+    assert back.engine.gap_buffer == pytest.approx(0.01, abs=1e-12)
+    assert back == c2
