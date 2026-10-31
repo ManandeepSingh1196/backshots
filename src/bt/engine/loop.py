@@ -66,7 +66,11 @@ class EngineConfig:
                 f"global_max_leverage must be finite and >= 1, got {self.global_max_leverage!r}"
             )
         b = self.buy_buffer
-        if isinstance(b, bool) or not (math.isfinite(b) and 0 <= b < 1):
+        if (
+            isinstance(b, bool)
+            or not isinstance(b, int | float)  # pyright: ignore[reportUnnecessaryIsInstance]
+            or not (math.isfinite(b) and 0 <= b < 1)
+        ):
             raise EngineError(f"buy_buffer must be finite and in [0, 1), got {b!r}")
 
 
