@@ -9,6 +9,7 @@ import pytest
 
 import bt.engine.backtest as bt_backtest
 import bt.engine.loop as bt_loop
+from bt.core.errors import StrategyError
 from bt.engine.backtest import run_backtest
 from bt.engine.loop import EngineConfig
 from bt.runs.config import load_config
@@ -176,8 +177,6 @@ def test_determinism(tmp_path: Path) -> None:
 
 
 def test_errors_write_nothing(tmp_path: Path) -> None:
-    from bt.core.errors import StrategyError
-
     for targets, who in (("[{ZZZUSDT = 0.1}]", "ZZZUSDT"), ("[{AAAUSDT = -0.1}]", "AAAUSDT")):
         with pytest.raises(StrategyError, match=who):
             go(tmp_path, f'["{A}"]', targets, "bad")

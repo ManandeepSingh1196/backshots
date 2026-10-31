@@ -8,8 +8,9 @@ from datetime import UTC, datetime, timedelta
 import numpy as np
 import pytest
 
+import bt.engine.loop as bt_loop
 from bt.core.errors import EngineError, LookAheadError, StrategyError
-from bt.core.events import EventLog, OrderRecord
+from bt.core.events import EventLog, OrderRecord, SkippedOrder
 from bt.core.types import Bar, Instrument, InstrumentKind, Order, OrderStatus, OrderType, Side
 from bt.engine.loop import EngineConfig, EngineResult, run_engine
 from bt.execution.broker_sim import BrokerSim
@@ -17,7 +18,7 @@ from bt.execution.fees import VenueFees
 from bt.execution.slippage import FixedBps, SlippageModel
 from bt.portfolio.portfolio import Portfolio
 from bt.runs.frames import orders_frame
-from bt.strategy.base import Intent, NoAction, TargetWeights
+from bt.strategy.base import Intent, NoAction, Orders, TargetWeights
 from bt.strategy.context import Context
 from tests.support.memory_feed import MemoryFeed
 from tests.support.scripted import ScriptedStrategy
@@ -564,14 +565,13 @@ def weights_hook(
     return lambda ctx: TargetWeights(dict(targets[ctx.now])) if ctx.now in targets else None
 
 
-def rotation(**kw: object) -> Run:
+def rotation() -> Run:
     return run(
         ROT_BARS,
         {},
         insts=(AAAr, BBBr),
         slip=FixedBps(5),
         hook=weights_hook({d(1): {A: 1.0}, d(2): {B: 1.0}}),
-        **kw,  # type: ignore[arg-type]
     )
 
 
@@ -595,11 +595,80 @@ def test_rotation_sells_and_buys_in_one_bar() -> None:
     assert [e.equity for e in r.result.equity] == pytest.approx(want, abs=1e-6)
 
 
-def test_rotation_credit_is_required() -> None:
+def _no_credit(self: object, order: Order, buffer: float) -> None:
+    return None
+
+
+def test_rotation_credit_is_required(monkeypatch: pytest.MonkeyPatch) -> None:
     r = rotation()
-    # at d2 cash is only ~5.009253; the buy leg needs 19.712 * 50 * 1.001 = 986.5856
+    assert records(r, ROT_BUY)[0] == (d(2), OrderStatus.NEW, "")
+    # at d2 cash is only ~5.009253; the buy leg is NEW only because of credit_sale
     assert r.result.equity[1].cash == pytest.approx(5.009253, abs=1e-6)
-    assert pytest.approx(986.5856, abs=1e-6) == 19.712 * 50 * 1.001
+    monkeypatch.setattr(bt_loop._ReservingView, "credit_sale", _no_credit)  # pyright: ignore[reportPrivateUsage]
+    r2 = rotation()
+    assert records(r2, ROT_BUY) == [(d(2), OrderStatus.REJECTED, "insufficient_cash")]
+
+
+def test_reserving_view_credit_sale() -> None:
+    pf = Portfolio(1000.0, (AAAr,))
+    view = bt_loop._ReservingView(pf.view(), {A: AAAr}, {A: 100.0})  # pyright: ignore[reportPrivateUsage]
+    assert view.available_cash == pytest.approx(1000.0, abs=1e-9)
+    view.credit_sale(Order("s", A, Side.SELL, 9.935), 0.0055)
+    # 9.935 * 100 * (1 - 0.001) * (1 - 0.0055)
+    assert view.available_cash == pytest.approx(1000.0 + 987.04771425, abs=1e-6)
+
+
+def open_sell_run(limit: bool, patch_buy: bool, monkeypatch: pytest.MonkeyPatch) -> Run:
+    """A has no bar on d3, so its d2 sell stays open when d3's target is decided."""
+    bars = [flat(A, 1, 100), flat(A, 2, 100), flat(A, 4, 100)]
+    bars += [flat(B, i, 50) for i in range(1, 5)]
+    lim = Order("lim", A, Side.SELL, 9.935, OrderType.LIMIT, limit_price=1000.0)
+    buy_b = Order("bt-rb-BBBUSDT-202401030000", B, Side.BUY, 19.712, tag="rebalance")
+    if patch_buy:
+        real = bt_loop.weights_to_orders
+
+        def fake(
+            weights: Mapping[str, float],
+            ctx: Context,
+            band: float,
+            cap: float,
+            *,
+            open_orders: Sequence[Order] = (),
+            cash_buffer: float = 0.0,
+        ) -> tuple[list[Order], list[SkippedOrder]]:
+            if ctx.now == d(3):
+                return [buy_b], []
+            return real(weights, ctx, band, cap, open_orders=open_orders, cash_buffer=cash_buffer)
+
+        monkeypatch.setattr(bt_loop, "weights_to_orders", fake)
+    targets: dict[datetime, Mapping[str, float]] = {d(1): {A: 1.0}, d(3): {B: 1.0}}
+    if not limit:
+        targets[d(2)] = {}
+    base = weights_hook(targets)
+
+    def hook(ctx: Context) -> Intent | None:
+        if limit and ctx.now == d(2):
+            return Orders([lim])
+        return base(ctx)
+
+    return run(bars, {}, insts=(AAAr, BBBr), slip=FixedBps(5), hook=hook)
+
+
+def test_open_market_sell_is_credited(monkeypatch: pytest.MonkeyPatch) -> None:
+    r = open_sell_run(False, False, monkeypatch)
+    buy_id = "bt-rb-BBBUSDT-202401030000"
+    assert records(r, "bt-rb-AAAUSDT-202401020000")[0] == (d(2), OrderStatus.NEW, "")
+    assert records(r, buy_id)[0] == (d(3), OrderStatus.NEW, "")
+    fill = next(f for f in r.result.fills if f.order_id == buy_id)
+    assert fill.ts == d(4)
+    assert fill.qty == pytest.approx(19.712, abs=1e-9)
+
+
+def test_open_limit_sell_is_not_credited(monkeypatch: pytest.MonkeyPatch) -> None:
+    r = open_sell_run(True, True, monkeypatch)
+    assert records(r, "bt-rb-BBBUSDT-202401030000") == [
+        (d(3), OrderStatus.REJECTED, "insufficient_cash")
+    ]
 
 
 def test_orders_path_gets_no_credit() -> None:
@@ -689,10 +758,10 @@ def test_on_fill_fires_for_rebalance_fills() -> None:
     assert ids[:3] == [ROT_ID_A, ROT_SELL, ROT_BUY]
 
 
-@pytest.mark.parametrize("bad", [-0.1, 1.0, float("nan"), float("inf"), True])
-def test_buy_buffer_validation(bad: float) -> None:
+@pytest.mark.parametrize("bad", [-0.1, 1.0, float("nan"), float("inf"), True, None, "x"])
+def test_buy_buffer_validation(bad: object) -> None:
     with pytest.raises(EngineError):
-        EngineConfig(buy_buffer=bad)
+        EngineConfig(buy_buffer=bad)  # type: ignore[arg-type]  # deliberately invalid
 
 
 def test_buy_buffer_default() -> None:
