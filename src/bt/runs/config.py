@@ -172,6 +172,7 @@ class EngineSection(BaseModel):
     order_ttl_bars: Annotated[_Int, Field(ge=1)] = 3
     global_max_leverage: Annotated[_Num, Field(ge=1)] = 2.0
     max_drawdown_kill: float | Literal["off"] = 0.40
+    gap_buffer: Annotated[_Num, Field(ge=0, lt=1)] = 0.005
 
     @field_validator("max_drawdown_kill", mode="before")
     @classmethod

@@ -7,7 +7,7 @@ import pytest
 from bt.strategy import registry
 
 # Registered at import by design (tests/support); every other test-only name must not leak.
-_ALLOWED = frozenset({"test_buy_once"})
+_ALLOWED = frozenset({"test_buy_once", "test_weights"})
 
 
 def leaked_strategies(registry_items: Mapping[str, type[object]]) -> list[str]:
