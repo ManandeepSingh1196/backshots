@@ -117,6 +117,7 @@ def run_backtest(
         None if kill == "off" else kill,
         cfg.engine.rebalance_band,
         cfg.engine.global_max_leverage,
+        buy_buffer=cfg.costs.slippage.bps / 10_000 + cfg.engine.gap_buffer,
     )
 
     started_at = _utcnow()

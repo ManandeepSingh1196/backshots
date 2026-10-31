@@ -27,14 +27,16 @@ from bt.core.types import (
     Side,
 )
 from bt.data.feed import DataFeed
+from bt.engine.rebalance import weights_to_orders
 from bt.execution.broker import BacktestBroker
 from bt.execution.rules import validate_order
 from bt.portfolio.portfolio import Portfolio
 from bt.strategy.base import NoAction, Orders, Strategy, TargetWeights
-from bt.strategy.context import StepContext
+from bt.strategy.context import Context, StepContext
 
 _KILL_REL_TOL: Final = 1e-9
 _RESERVED_PREFIX: Final = "bt-"
+_REBALANCE_PREFIX: Final = "bt-rb-"
 
 
 @dataclass(frozen=True, slots=True)
@@ -42,13 +44,14 @@ class EngineConfig:
     """Engine switches.
 
     Invariants: max_drawdown_kill is None or in (0, 1]; rebalance_band >= 0;
-    global_max_leverage >= 1; every number is finite.
+    global_max_leverage >= 1; buy_buffer is in [0, 1); every number is finite.
     """
 
     close_at_end: bool = True
     max_drawdown_kill: float | None = 0.40
-    rebalance_band: float = 0.02  # unused until M5
-    global_max_leverage: float = 2.0  # unused until M5
+    rebalance_band: float = 0.02
+    global_max_leverage: float = 2.0
+    buy_buffer: float = 0.0055
 
     def __post_init__(self) -> None:
         k = self.max_drawdown_kill
@@ -62,6 +65,9 @@ class EngineConfig:
             raise EngineError(
                 f"global_max_leverage must be finite and >= 1, got {self.global_max_leverage!r}"
             )
+        b = self.buy_buffer
+        if isinstance(b, bool) or not (math.isfinite(b) and 0 <= b < 1):
+            raise EngineError(f"buy_buffer must be finite and in [0, 1), got {b!r}")
 
 
 @dataclass(frozen=True, slots=True)
@@ -86,7 +92,8 @@ class EngineResult:
 class _ReservingView:
     """PortfolioView that holds back cash and holdings already promised to pending orders.
 
-    Invariants: available_cash == base.available_cash - reserved cash; position(sym).qty ==
+    Invariants: available_cash == base.available_cash - reserved cash + credited sale proceeds
+    (credits happen only on the target-weights path); position(sym).qty ==
     base qty - reserved sells (never below zero); everything else delegates to the base view.
     """
 
@@ -118,6 +125,12 @@ class _ReservingView:
         else:
             p = self._last_close[order.symbol]
         self._cash += order.qty * p * (1 + max(inst.maker_fee, inst.taker_fee, 0.0))
+
+    def credit_sale(self, order: Order, buffer: float) -> None:
+        """Count the haircut proceeds of a pending market sell as cash (rebalance rotations)."""
+        inst = self._inst[order.symbol]
+        rate = max(inst.maker_fee, inst.taker_fee, 0.0)
+        self._cash -= order.qty * self._last_close[order.symbol] * (1 - rate) * (1 - buffer)
 
     @property
     def ts(self) -> datetime | None:
@@ -261,7 +274,9 @@ def run_engine(
                 ready = all(len(ctx.history(s, warmup).ts) >= warmup for s in ctx.symbols())
             if ready:
                 raw: object = _guard("on_bar", ts, strategy.on_bar, ctx)
-                _submit_intent(raw, ts, broker, log, inst_by_sym, last_close, seen, portfolio)
+                _submit_intent(
+                    raw, ctx, config, broker, log, inst_by_sym, last_close, seen, portfolio
+                )
         pending = portfolio.snapshot()
 
     if last_ts is None:
@@ -275,7 +290,7 @@ def run_engine(
         equity=log.equity(),
         fills=log.fills(),
         orders=log.orders(),
-        skipped=(),
+        skipped=log.skipped(),
         messages=log.messages(),
         final_positions=tuple(portfolio.positions().values()),
         killed_at=killed_at,
@@ -285,7 +300,8 @@ def run_engine(
 
 def _submit_intent(
     raw: object,
-    ts: datetime,
+    ctx: Context,
+    config: EngineConfig,
     broker: BacktestBroker,
     log: EventLog,
     inst_by_sym: Mapping[str, Instrument],
@@ -295,17 +311,55 @@ def _submit_intent(
 ) -> None:
     if isinstance(raw, NoAction):
         return
-    if isinstance(raw, TargetWeights):
-        raise StrategyError(f"TargetWeights needs the M5 rebalancer (at {ts.isoformat()})")
-    if not isinstance(raw, Orders):
+    if not isinstance(raw, Orders | TargetWeights):
         raise StrategyError(f"on_bar returned {type(raw).__name__}, not an Intent")
     view = _ReservingView(portfolio.view(), inst_by_sym, last_close)
-    for o in broker.open_orders():
+    open_orders = broker.open_orders()
+    for o in open_orders:
         view.reserve(o)
+    if isinstance(raw, TargetWeights):
+        # Errors from weights_to_orders are raised after on_bar returned: not guarded.
+        orders, skipped = weights_to_orders(
+            raw.weights,
+            ctx,
+            config.rebalance_band,
+            config.global_max_leverage,
+            open_orders=open_orders,
+            cash_buffer=config.buy_buffer,
+        )
+        for sk in skipped:
+            log.record_skipped(sk)
+        for o in open_orders:
+            if o.side == Side.SELL and o.type == OrderType.MARKET:
+                view.credit_sale(o, config.buy_buffer)
+        credit: float | None = config.buy_buffer
+    else:
+        orders = raw.orders
+        credit = None
+    _admit(orders, ctx.now, broker, log, inst_by_sym, last_close, seen, view, credit)
+
+
+def _admit(
+    orders: Sequence[Order],
+    ts: datetime,
+    broker: BacktestBroker,
+    log: EventLog,
+    inst_by_sym: Mapping[str, Instrument],
+    last_close: Mapping[str, float],
+    seen: set[str],
+    view: _ReservingView,
+    credit_buffer: float | None,
+) -> None:
+    """Validate `orders` in sequence against `view` and submit the accepted ones.
+
+    credit_buffer is None on the Orders path; on the TargetWeights path it is the buy buffer,
+    sells are credited at that haircut and engine-made `bt-rb-` ids skip the prefix check.
+    """
     accepted: list[Order] = []
-    for order in raw.orders:
+    for order in orders:
         reason = ""
-        if order.id in seen or order.id.startswith(_RESERVED_PREFIX):
+        engine_made = credit_buffer is not None and order.id.startswith(_REBALANCE_PREFIX)
+        if order.id in seen or (order.id.startswith(_RESERVED_PREFIX) and not engine_made):
             reason = "duplicate_id"
         elif order.symbol not in inst_by_sym:
             reason = "unknown_symbol"
@@ -319,6 +373,8 @@ def _submit_intent(
             log.record_order(_rejected(ts, order, reason))
         else:
             view.reserve(order)
+            if credit_buffer is not None and order.side == Side.SELL:
+                view.credit_sale(order, credit_buffer)
             accepted.append(order)
     broker.submit(accepted)
 
